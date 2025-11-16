@@ -30,10 +30,10 @@ CONFIG = {
     'imap_host': 'localhost',
     'imap_port': 993,
     'imap_user': 'user@example.com',  # UPDATE THIS
-    'imap_password': None,  # Will prompt or read from env
+    'imap_password': 'ChangeMe',  # Will prompt or read from env
     'rspamd_url': 'http://localhost:11334',
-    'rspamd_password': None,  # Optional, for stats
-    'spam_folder': 'Junk',
+    'rspamd_password': 'ChangeMeToo',  # Optional, for stats
+    'spam_folder': 'Junk Mail',
     'ham_folder': 'INBOX',
     'max_messages': 1000,  # Max messages to train per run
     'state_file': '/tmp/rspamd-train-state.json',
@@ -82,6 +82,10 @@ class RspamdTrainer:
     def get_message_uids(self, imap, folder):
         """Get all message UIDs from a folder"""
         try:
+            # Add quotes around folder name if it contains spaces
+            if ' ' in folder:
+                folder = f'"{folder}"'
+            
             status, data = imap.select(folder, readonly=True)
             if status != 'OK':
                 print(f"✗ Could not select folder: {folder}")
@@ -113,21 +117,35 @@ class RspamdTrainer:
         endpoint = 'learnspam' if is_spam else 'learnham'
         url = f"{self.config['rspamd_url']}/{endpoint}"
         
+        # Build headers with password if configured
+        headers = {'Content-Type': 'message/rfc822'}
+        
+        rspamd_password = self.config.get('rspamd_password') or os.getenv('RSPAMD_PASSWORD')
+        if rspamd_password:
+            headers['Password'] = rspamd_password
+        
         try:
             response = requests.post(
                 url,
                 data=message_data,
-                headers={'Content-Type': 'message/rfc822'},
+                headers=headers,
                 timeout=10
             )
-            
-            if response.status_code == 200:
-                result = response.json()
-                if result.get('success', False):
+
+            # Success status codes:
+            # 200: Success with response
+            # 204: Success, no content
+            # 208: Already learned (still counts as success)
+            if response.status_code in [200, 204, 208]:
+                if response.status_code == 200:
+                    result = response.json()
+                    if result.get('success', False):
+                        return True
+                    # If JSON has success=false, still treat as warning but continue
+                    print(f"  Warning: {result.get('error', 'unknown error')}")
                     return True
-                else:
-                    print(f"  Warning: Training failed - {result.get('error', 'unknown error')}")
-                    return False
+                # 204 and 208 are success
+                return True
             else:
                 print(f"  Warning: HTTP {response.status_code} - {response.text[:100]}")
                 return False
@@ -166,7 +184,8 @@ class RspamdTrainer:
             new_uids = new_uids[:self.config['max_messages']]
         
         # Select folder for fetching
-        imap.select(folder, readonly=True)
+        folder_name = f'"{folder}"' if ' ' in folder else folder
+        imap.select(folder_name, readonly=True)
         
         # Train each message
         success_count = 0
