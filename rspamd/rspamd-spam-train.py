@@ -303,13 +303,20 @@ Examples:
   %(prog)s --train              Train from new messages
   %(prog)s --stats              Show training statistics
   %(prog)s --reset              Reset training state
-  
-Configuration:
-  Set IMAP_PASSWORD environment variable to avoid password prompt:
-    export IMAP_PASSWORD="your_password"
-    %(prog)s --train
-  
-  Or edit the CONFIG dictionary in the script.
+
+  # With credentials as arguments (best for cron/scripts)
+  %(prog)s --train --imap-user user@domain.com --imap-password secret
+
+  # Short aliases work too
+  %(prog)s --train --username user@domain.com --password secret
+
+  # Override spam folder
+  %(prog)s --train --spam-folder "Junk Mail"
+
+Configuration Priority (highest to lowest):
+  1. Command-line arguments (--imap-user, --imap-password)
+  2. Environment variables (IMAP_PASSWORD, RSPAMD_PASSWORD)
+  3. CONFIG dictionary in the script
         """
     )
     
@@ -319,16 +326,24 @@ Configuration:
                        help='Show training statistics')
     parser.add_argument('--reset', action='store_true',
                        help='Reset training state file')
+    parser.add_argument('--imap-user', '--username', dest='imap_user',
+                       help=f"IMAP username (default: {CONFIG['imap_user']})")
+    parser.add_argument('--imap-password', '--password', dest='imap_password',
+                       help='IMAP password (overrides env var and config)')
     parser.add_argument('--spam-folder', default=CONFIG['spam_folder'],
                        help=f"Spam folder name (default: {CONFIG['spam_folder']})")
     parser.add_argument('--ham-folder', default=CONFIG['ham_folder'],
                        help=f"Ham folder name (default: {CONFIG['ham_folder']})")
     parser.add_argument('--max', type=int, default=CONFIG['max_messages'],
                        help=f"Max messages per run (default: {CONFIG['max_messages']})")
-    
+
     args = parser.parse_args()
-    
-    # Update config from args
+
+    # Update config from args (CLI args have highest priority)
+    if args.imap_user:
+        CONFIG['imap_user'] = args.imap_user
+    if args.imap_password:
+        CONFIG['imap_password'] = args.imap_password
     CONFIG['spam_folder'] = args.spam_folder
     CONFIG['ham_folder'] = args.ham_folder
     CONFIG['max_messages'] = args.max
