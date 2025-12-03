@@ -15,6 +15,25 @@ case "$1" in
         echo "Stopping rspamd and redis..."
         docker compose down
         ;;
+    --update|update)
+        echo "Updating rspamd to latest image version..."
+        echo "This will pull the new image and recreate containers."
+        read -p "Continue with update? (yes/no): " confirm
+        if [ "$confirm" = "yes" ]; then
+            echo "Pulling latest images..."
+            docker compose pull
+            echo "Recreating containers with new images..."
+            docker compose up -d
+            echo "Waiting for rspamd to start..."
+            sleep 3
+            echo ""
+            echo "✓ Update complete"
+            echo "Run '$0 --status' to verify containers are running"
+            echo "Run '$0 --doctor' for a full health check"
+        else
+            echo "Cancelled"
+        fi
+        ;;
     --restart|restart)
         echo "⚠ WARNING: Restarting will reload all configs from disk."
         echo "Consider using --reload instead for config changes."
@@ -61,6 +80,10 @@ case "$1" in
     --headers|headers)
         echo "Current milter_headers config:"
         docker exec rspamd rspamadm configdump milter_headers
+        ;;
+    --dump|dump)
+        echo "Current configdump:"
+        docker exec rspamd rspamadm configdump
         ;;
     --force-actions|force-actions)
         echo "Current force_actions config:"
@@ -158,6 +181,9 @@ case "$1" in
     --shell|shell)
         docker exec -it rspamd /bin/sh
         ;;
+    --root|root)
+        docker exec -u 0 -it rspamd bash
+        ;;
     --redis-shell|redis-shell)
         docker exec -it redis redis-cli
         ;;
@@ -177,15 +203,18 @@ case "$1" in
         echo "  --actions          - Show current action thresholds"
         echo "  --headers          - Show milter_headers configuration"
         echo "  --force-actions    - Show force_actions configuration (subject rewrite protection)"
+        echo "  --dump             - Show all configuration"
         echo ""
         echo "Container Management:"
         echo "  --start            - Start rspamd and redis containers"
         echo "  --stop             - Stop rspamd and redis containers"
+        echo "  --update           - Pull latest image and recreate containers"
         echo "  --restart          - Restart rspamd (RARELY NEEDED - use --reload instead)"
         echo ""
         echo "Troubleshooting:"
         echo "  --clear-redis      - Clear Redis database and reload config"
         echo "  --shell            - Open shell in rspamd container"
+        echo "  --root             - Open root bash shell in rspamd container"
         echo "  --redis-shell      - Open Redis CLI"
         echo ""
         echo "  --help, -h         - Show this help message"
