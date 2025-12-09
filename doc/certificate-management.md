@@ -4,6 +4,35 @@
 
 Stalwart provides comprehensive certificate management capabilities through its HTTP API and CLI tools. This document covers certificate reloading, ACME support, and programmatic certificate management.
 
+**Official Documentation:**
+- [ACME Configuration](https://stalw.art/docs/category/acme/) - Automatic certificate management with Let's Encrypt
+- [TLS Configuration](https://stalw.art/docs/server/tls/overview) - TLS settings and certificate setup
+- [Reverse Proxy Setup](https://stalw.art/docs/server/reverse-proxy/overview) - Nginx, HAProxy, and proxy protocol configuration
+
+## Quick Reference
+
+**Common Questions:**
+
+| Question | Answer |
+|----------|--------|
+| Can I use dots in certificate IDs? | **Yes** - `certificate.mail.example.com.cert` is valid |
+| Do I need to restart after updating certs? | **No** - Use `stalwart-cli server reload-certificates` (zero downtime) |
+| When are `%{file:...}%` macros expanded? | **At startup and reload** - not continuously, must reload after file changes |
+| What does `list-config` show? | **Raw stored values** with unexpanded macros like `%{file:...}%` |
+| How many certificates should have `default = true`? | **Only ONE** - it's the fallback for non-SNI clients |
+| Should I create separate certs per subdomain? | **No** - Use one cert with SANs for all domains (simpler & better) |
+
+**Syntax Examples:**
+```toml
+# Recommended: File reference with macro
+certificate.default.cert = "%{file:/opt/stalwart/certs/fullchain.pem}%"
+certificate.default.private-key = "%{file:/opt/stalwart/certs/privkey.pem}%"
+certificate.default.default = true
+
+# Using domain as ID (dots allowed)
+certificate.mail.example.com.cert = "%{file:/opt/stalwart/certs/mail.example.com.pem}%"
+```
+
 ## Certificate Reloading
 
 ### API Endpoint
@@ -29,11 +58,13 @@ Perfect for automated certificate renewal scripts (e.g., Let's Encrypt) to updat
 
 ## ACME (Automatic Certificate Management Environment)
 
-Stalwart provides built-in ACME support for automatic certificate provisioning and renewal:
+Stalwart provides built-in ACME support for automatic certificate provisioning and renewal.
+
+**See official documentation:** [ACME Configuration Guide](https://stalw.art/docs/category/acme/)
 
 ### Supported Challenge Types
 - `TLS-ALPN-01`
-- `DNS-01` 
+- `DNS-01`
 - `HTTP-01`
 
 ### Supported DNS Providers
@@ -52,6 +83,59 @@ Stalwart provides built-in ACME support for automatic certificate provisioning a
 - `acme.<id>.provider` - DNS provider
 - `acme.<id>.secret` - API credentials
 - `acme.<id>.renew-before` - Renewal timing
+
+## Alternative: Using acme.sh for Certificate Management
+
+For users who prefer external certificate management tools or are already using acme.sh for other services, acme.sh provides an excellent alternative to Stalwart's built-in ACME support.
+
+### Benefits of acme.sh
+- Proven reliability across many platforms (Zimbra, Stalwart, etc.)
+- Works with any DNS provider (DNS-01 challenge)
+- Automatic renewal via cron
+- Single tool for managing certificates across multiple services
+- Custom deploy hooks for seamless integration
+
+### Quick Setup
+
+1. **Install acme.sh** (one-time):
+   ```bash
+   curl https://get.acme.sh | sh -s email=your@email.com
+   ```
+
+2. **Configure Let's Encrypt** (one-time):
+   ```bash
+   acme.sh --set-default-ca --preferred-chain "ISRG" --server letsencrypt
+   ```
+
+3. **Issue certificate** (using Cloudflare DNS-01 as example):
+   ```bash
+   acme.sh --issue --dns dns_cf -d mail.example.com -d example.com -d smtp.example.com
+   ```
+
+4. **Deploy to Stalwart** (using custom deploy hook):
+   ```bash
+   acme.sh --deploy --deploy-hook stalwart -d mail.example.com
+   ```
+
+5. **Automatic renewal**: acme.sh installs a cron job automatically:
+   ```cron
+   39 7 * * * "/home/user/.acme.sh"/acme.sh --cron --home "/home/user/.acme.sh" > /dev/null
+   ```
+
+### Stalwart Deploy Hook
+
+A custom deploy hook for Stalwart is available at:
+- [acme.sh stalwart deploy hook](https://github.com/JimDunphy/acme.sh/blob/master/deploy/stalwart.sh)
+
+The deploy hook handles:
+- Installing certificates to the correct location
+- Triggering certificate reload via Stalwart API (zero downtime)
+- Proper file permissions
+
+**Additional Resources:**
+- [acme.sh Documentation](https://github.com/acmesh-official/acme.sh)
+- [DNS API Integration Guide](https://github.com/acmesh-official/acme.sh/wiki/dnsapi)
+- Zimbra wiki articles by JDunphy for additional deployment examples
 
 ## Other Certificate-Related APIs
 
@@ -95,20 +179,159 @@ For automation scripts, consider creating an API user with only `SettingsReload`
 ### 3. Verify certificate reload success
 Both the CLI command and API call return a JSON response with the updated configuration data.
 
+## Certificate Configuration
+
+### Configuration Pattern
+
+Certificates are configured using the pattern `certificate.<id>.*` where `<id>` is a unique identifier for the certificate.
+
+**Allowed characters in `<id>`:**
+- Alphanumeric: `a-z`, `A-Z`, `0-9`
+- Special characters: `.` (dot), `-` (hyphen), `_` (underscore)
+- **Dots are allowed**, enabling patterns like: `certificate.mail.example.com.cert`
+
+### Configuration Methods
+
+#### Method 1: File References (Recommended)
+
+Use the `%{file:...}%` macro to load certificates from disk:
+
+```toml
+# Flattened format
+certificate.default.cert = "%{file:/opt/stalwart/etc/certs/fullchain.pem}%"
+certificate.default.private-key = "%{file:/opt/stalwart/etc/certs/privkey.pem}%"
+certificate.default.default = true
+
+# Or using domain as ID (dots allowed)
+certificate.mail.example.com.cert = "%{file:/opt/stalwart/etc/certs/mail.example.com/fullchain.pem}%"
+certificate.mail.example.com.private-key = "%{file:/opt/stalwart/etc/certs/mail.example.com/privkey.pem}%"
+
+# Or table format (equivalent)
+[certificate.default]
+cert = "%{file:/opt/stalwart/etc/certs/fullchain.pem}%"
+private-key = "%{file:/opt/stalwart/etc/certs/privkey.pem}%"
+default = true
+```
+
+#### Method 2: Inline PEM Content
+
+Embed certificate content directly in configuration:
+
+```toml
+[certificate.default]
+cert = """-----BEGIN CERTIFICATE-----
+MIIDXTCCAkWgAwIBAgIJAKZ...
+-----END CERTIFICATE-----"""
+private-key = """-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w...
+-----END PRIVATE KEY-----"""
+default = true
+```
+
+### Default Certificate Behavior
+
+**Important:** Only ONE certificate should be marked with `default = true`.
+
+The default certificate is used when:
+1. Client doesn't support SNI (Server Name Indication)
+2. Client connects without providing SNI (e.g., by IP address)
+3. Client provides SNI that doesn't match any certificate's subject/SAN names
+
+```toml
+# Correct: Only one default
+certificate.default.default = true
+
+# Wrong: Multiple defaults causes undefined behavior
+certificate.cert1.default = true
+certificate.cert2.default = true  # DON'T DO THIS
+```
+
+### Best Practice: Use SANs (Subject Alternative Names)
+
+Instead of creating separate certificates for each subdomain, use ONE certificate with multiple SANs:
+
+```toml
+# Recommended: Single certificate with SANs for all domains
+certificate.default.cert = "%{file:/opt/stalwart/certs/fullchain.pem}%"
+certificate.default.private-key = "%{file:/opt/stalwart/certs/privkey.pem}%"
+certificate.default.default = true
+```
+
+Where the certificate includes SANs for:
+- `example.com`
+- `mail.example.com`
+- `smtp.example.com`
+- `imap.example.com`
+- `mta-sts.example.com`
+
+This approach:
+- Simplifies configuration
+- Works correctly for both SNI and non-SNI clients
+- Reduces certificate management overhead
+- Follows industry best practices
+
+**See also:** [TLS Configuration Overview](https://stalw.art/docs/server/tls/overview) for more details on certificate setup.
+
 ## Configuration Storage
 
 Certificate configurations are stored in the database (or configuration store) using keys with the pattern `certificate.*` and are loaded into memory at runtime.
 
+### Viewing Stored Configuration
+
+```bash
+stalwart-cli server list-config | grep certificate
+```
+
+**Important:** `list-config` displays **raw stored values**, including unexpanded macros like `%{file:...}%`. The actual certificate content is only loaded when the configuration is built (at startup or reload).
+
 ## Implementation Details
 
-The certificate reloading mechanism works as follows:
-1. Stalwart server receives API call to `/api/reload/certificate`
-2. Server reads updated certificate configuration from storage
-3. Parses certificate data 
-4. Updates in-memory certificate cache
-5. Makes new certificates available immediately without restart
+### Macro Expansion Timing
+
+The `%{file:...}%` macro is expanded **at configuration build time**, not at storage time:
+
+1. **At Server Startup**: `Config::build_config()` is called, which:
+   - Loads configuration from storage
+   - Calls `config.resolve_all_macros().await` (see `crates/utils/src/config/mod.rs:70-171`)
+   - Reads file contents from disk
+   - Expands environment variables
+   - Builds the final configuration in memory
+
+2. **At Reload**: Same process - macros are re-expanded with current values:
+   - `stalwart-cli server reload-certificates` triggers reload
+   - File contents are re-read from disk
+   - Updated certificates become active without restart
+
+**Key insight:** When you update a certificate file on disk, you **must reload** for Stalwart to read the new content. The macro is not continuously evaluated.
+
+### Certificate Reloading Mechanism
+
+The certificate reloading works as follows:
+1. Stalwart server receives API call to `/api/reload/certificate` (see `crates/http/src/management/reload.rs:59-62`)
+2. Server calls `reload_certificates()` function (see `crates/common/src/manager/reload.rs:42-50`)
+3. Configuration is rebuilt (macros expanded from storage)
+4. Certificates are parsed using `parse_certificates()` (see `crates/common/src/config/server/tls.rs:318-415`)
+5. Certificate IDs are extracted via `config.sub_keys("certificate", ".cert")` (see `crates/utils/src/config/utils.rs:107-130`)
+6. PEM data is parsed using `rustls_pemfile::certs()` (see `crates/common/src/config/server/tls.rs:418`)
+7. In-memory certificate store is atomically updated using ArcSwap
+8. New certificates are available immediately without restart
 
 This approach ensures zero downtime and immediate certificate availability.
+
+### Configuration Parsing Details
+
+**Certificate ID Extraction** (`crates/utils/src/config/utils.rs:107-130`):
+- Pattern `certificate.<id>.cert` is parsed
+- Prefix `"certificate."` is stripped
+- Suffix `".cert"` is stripped
+- Everything between becomes the certificate ID
+- Example: `certificate.mail.example.com.cert` → ID is `mail.example.com`
+
+**File Macro Reading** (`crates/utils/src/config/mod.rs:117-122`):
+- Files are read with `tokio::fs::read(file_name).await`
+- Content is converted to UTF-8 string
+- Entire file content (including trailing newlines) is inserted into config value
+- No trimming is performed (certificates handle trailing whitespace gracefully)
 
 ## Key Rust Implementation Files
 
