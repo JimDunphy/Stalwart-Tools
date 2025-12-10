@@ -407,6 +407,105 @@ openssl rsa -noout -modulus -in /opt/stalwart/certs/privkey.pem | openssl md5
 **Correct syntax:**
 - `certificate.default.cert = "%{file:/opt/stalwart/certs/cert.pem}%"` ✅
 
+#### 7. Proxy Protocol Misconfiguration (Common with Nginx/HAProxy)
+
+**Symptoms:**
+- TLS handshake errors that look like certificate problems: "DecryptError", "UnexpectedMessage", "SignatureAlgorithmsExtensionRequired"
+- Errors only occur when using reverse proxy (Nginx, HAProxy)
+- Direct connections work fine
+- `openssl s_client` fails through proxy but works directly
+
+**Root Cause:**
+When using Nginx/HAProxy with `proxy_protocol on`, the proxy sends a PROXY protocol header before the TLS handshake. If Stalwart's `server.proxy.trusted-networks` is **not configured** or doesn't include the correct IP address, Stalwart will **reject the connection** before certificates are even checked, causing errors that look like TLS/certificate failures.
+
+**How trusted-networks Works:**
+
+The `server.proxy.trusted-networks` setting controls which **server IPs in the PROXY protocol header** Stalwart trusts, NOT which IPs the TCP connection comes from.
+
+Example PROXY protocol header:
+```
+PROXY TCP4 192.168.1.87 192.168.1.6 55819 993
+           ^^^^^^^^^^^^^ ^^^^^^^^^^^
+           Client IP     Server IP (THIS is what trusted-networks checks!)
+```
+
+**Common Misconception:**
+```toml
+# WRONG - These are TCP connection sources, not what PROXY protocol checks
+server.proxy.trusted-networks = ["127.0.0.1", "172.17.0.0/16"]
+
+# CORRECT - Include the SERVER IP from the PROXY header
+server.proxy.trusted-networks = ["127.0.0.1", "172.17.0.0/16", "192.168.1.6"]
+                                                                ^^^^^^^^^^^^
+                                                        Your server's actual IP!
+```
+
+**What Happens Without Correct Configuration:**
+- If `server.proxy.trusted-networks` is **not configured** → Connection rejected
+- If `server.proxy.trusted-networks` doesn't contain the server IP → Connection rejected
+- Stalwart tries to parse the PROXY header as TLS data → TLS handshake fails with cryptic errors
+
+**Debugging Steps:**
+
+1. **Capture the PROXY protocol header with tcpdump:**
+   ```bash
+   # For Docker with port mapping like: -p 127.0.0.1:2993:993
+   sudo tcpdump -i lo -A -s 200 port 2993
+
+   # For standard installation
+   sudo tcpdump -i any -A -s 200 port 993
+
+   # Then trigger a connection from another terminal:
+   openssl s_client -connect host.example.com:993 -servername host.example.com
+   ```
+
+2. **Look for the PROXY header in tcpdump output:**
+   ```
+   PROXY TCP4 192.168.1.87 192.168.1.6 55819 993
+   ```
+
+   The **second IP** (192.168.1.6 in this example) is your server's IP that needs to be in `trusted-networks`.
+
+3. **Add the server IP to trusted-networks:**
+   ```toml
+   # config.toml
+   server.proxy.trusted-networks = ["127.0.0.0/8", "192.168.1.6", "172.17.0.0/16"]
+                                                    ^^^^^^^^^^^^
+                                            Add your server's IP here
+   ```
+
+4. **Reload configuration:**
+   ```bash
+   stalwart-cli server reload
+   ```
+
+5. **Test again:**
+   ```bash
+   openssl s_client -connect host.example.com:993 -servername host.example.com -showcerts
+   ```
+
+**Example Nginx Configuration:**
+
+If you're using Nginx stream proxy with proxy protocol:
+
+```nginx
+stream {
+    upstream stalwart_imaps {
+        server 127.0.0.1:2993;
+    }
+
+    server {
+        listen 993;
+        proxy_pass stalwart_imaps;
+        proxy_protocol on;  # Sends PROXY header to Stalwart
+    }
+}
+```
+
+You must configure Stalwart to trust the proxy protocol headers from your server's IP.
+
+**See also:** [Proxy Protocol Documentation](https://stalw.art/docs/server/reverse-proxy/proxy-protocol/) for complete details.
+
 ### Debug Checklist
 
 When certificates aren't loading, check in this order:
@@ -417,8 +516,9 @@ When certificates aren't loading, check in this order:
 4. ✅ **Verify PEM format** - use `openssl x509 -text`
 5. ✅ **Check cert/key match** - compare modulus hashes
 6. ✅ **Verify macro syntax** - must be `%{file:...}%`
-7. ✅ **Reload certificates** - `stalwart-cli server reload-certificates`
-8. ✅ **Check reload success** - look for errors in response/logs
+7. ✅ **If using proxy (Nginx/HAProxy)** - verify `trusted-networks` includes your server's IP
+8. ✅ **Reload certificates** - `stalwart-cli server reload-certificates`
+9. ✅ **Check reload success** - look for errors in response/logs
 
 ## Configuration Storage
 
