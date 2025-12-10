@@ -272,6 +272,154 @@ This approach:
 
 **See also:** [TLS Configuration Overview](https://stalw.art/docs/server/tls/overview) for more details on certificate setup.
 
+## Troubleshooting Certificate Issues
+
+### Common Problems
+
+#### 1. Certificate File Not Loading
+
+**Symptoms:**
+- TLS handshake failures
+- "No certificates found" errors
+- Clients can't connect with TLS
+
+**Check the logs for configuration errors:**
+
+```bash
+# Search for macro expansion errors
+journalctl -u stalwart-mail -n 500 | grep -i "macro"
+
+# Search for certificate parsing errors
+journalctl -u stalwart-mail -n 500 | grep -i "certificate"
+
+# Or check the Stalwart log file directly
+grep -i "macro\|certificate" /var/log/stalwart/stalwart.log
+```
+
+**Configuration error types** (see `crates/utils/src/config/mod.rs:log_errors()`):
+
+| Error Type | Cause | Example Message |
+|------------|-------|-----------------|
+| `MacroError` | Failed to read file or expand macro | `Macro expansion error for setting "certificate.default.cert": Failed to read file "/path/to/cert.pem": No such file or directory` |
+| `ParseError` | Invalid configuration syntax | `Failed to parse setting "certificate.default.cert": ...` |
+| `BuildError` | Configuration build failure | `Build error for key "certificate.default.cert": ...` |
+
+#### 2. File Permission Issues
+
+**Symptoms:**
+- MacroError with "Permission denied"
+
+**Fix:**
+```bash
+# Verify Stalwart can read the certificate files
+sudo -u stalwart cat /opt/stalwart/certs/fullchain.pem
+
+# If permission denied, fix ownership or permissions
+sudo chown stalwart:stalwart /opt/stalwart/certs/*.pem
+sudo chmod 644 /opt/stalwart/certs/fullchain.pem
+sudo chmod 600 /opt/stalwart/certs/privkey.pem  # Private key should be restrictive
+```
+
+**Note:** Unlike sendmail, Stalwart does **not** reject certificates with overly permissive permissions (e.g., world-readable). However, best practice is to restrict private key access to 600.
+
+#### 3. Wrong File Path
+
+**Symptoms:**
+- MacroError with "No such file or directory"
+
+**Verify:**
+```bash
+# Check file exists
+ls -la /opt/stalwart/certs/fullchain.pem
+
+# Check path in configuration
+stalwart-cli server list-config | grep certificate
+
+# Remember: list-config shows unexpanded macros
+# Example output: certificate.default.cert = "%{file:/opt/stalwart/certs/fullchain.pem}%"
+```
+
+#### 4. Invalid PEM Format
+
+**Symptoms:**
+- "No certificates found" or "Failed to read certificates"
+- Parsing errors in logs
+
+**Verify certificate format:**
+```bash
+# Check file type
+file /opt/stalwart/certs/fullchain.pem
+# Should output: "PEM certificate" or "ASCII text"
+
+# Verify it's valid PEM
+openssl x509 -in /opt/stalwart/certs/fullchain.pem -noout -text
+
+# Check for BOM or corruption at file start
+hexdump -C /opt/stalwart/certs/fullchain.pem | head -3
+# Should start with: 2d 2d 2d 2d 2d 42 45 47 49 4e (-----BEGIN)
+```
+
+**Common format issues:**
+- DER format instead of PEM (binary file)
+- PKCS12/PFX format (.pfx, .p12) - needs conversion
+- JKS format (.jks) - Java keystore, needs conversion
+- Certificate with BOM (Byte Order Mark) at start
+- Wrong file (CSR instead of certificate)
+
+**Convert DER to PEM:**
+```bash
+openssl x509 -inform DER -in cert.der -out cert.pem
+```
+
+**Convert PFX to PEM:**
+```bash
+# Extract certificate
+openssl pkcs12 -in cert.pfx -clcerts -nokeys -out cert.pem
+
+# Extract private key
+openssl pkcs12 -in cert.pfx -nocerts -nodes -out privkey.pem
+```
+
+#### 5. Certificate/Private Key Mismatch
+
+**Symptoms:**
+- TLS handshake errors: "DecryptError", "UnexpectedMessage"
+- Connections fail after reload
+
+**Verify certificate and key match:**
+```bash
+# Get certificate modulus
+openssl x509 -noout -modulus -in /opt/stalwart/certs/fullchain.pem | openssl md5
+
+# Get private key modulus
+openssl rsa -noout -modulus -in /opt/stalwart/certs/privkey.pem | openssl md5
+
+# The MD5 hashes MUST match
+```
+
+#### 6. Macro Syntax Errors
+
+**Wrong syntax (won't work):**
+- `certificate.default.cert = "file:///opt/stalwart/certs/cert.pem"` ❌
+- `certificate.default.cert = "%file:/opt/stalwart/certs/cert.pem%"` ❌ (missing braces)
+- `certificate.default.cert = "${file:/opt/stalwart/certs/cert.pem}"` ❌ (wrong delimiter)
+
+**Correct syntax:**
+- `certificate.default.cert = "%{file:/opt/stalwart/certs/cert.pem}%"` ✅
+
+### Debug Checklist
+
+When certificates aren't loading, check in this order:
+
+1. ✅ **Check logs** for MacroError/ParseError messages
+2. ✅ **Verify file exists** at the exact path specified
+3. ✅ **Test file permissions** - can Stalwart user read it?
+4. ✅ **Verify PEM format** - use `openssl x509 -text`
+5. ✅ **Check cert/key match** - compare modulus hashes
+6. ✅ **Verify macro syntax** - must be `%{file:...}%`
+7. ✅ **Reload certificates** - `stalwart-cli server reload-certificates`
+8. ✅ **Check reload success** - look for errors in response/logs
+
 ## Configuration Storage
 
 Certificate configurations are stored in the database (or configuration store) using keys with the pattern `certificate.*` and are loaded into memory at runtime.
