@@ -286,14 +286,14 @@ This approach:
 **Check the logs for configuration errors:**
 
 ```bash
-# Search for macro expansion errors
-journalctl -u stalwart-mail -n 500 | grep -i "macro"
+# Search for macro expansion errors (systemd installations)
+journalctl -u stalwart -n 500 | grep -i "macro"
 
 # Search for certificate parsing errors
-journalctl -u stalwart-mail -n 500 | grep -i "certificate"
+journalctl -u stalwart -n 500 | grep -i "certificate"
 
 # Or check the Stalwart log file directly
-grep -i "macro\|certificate" /var/log/stalwart/stalwart.log
+grep -i "macro\|certificate" /opt/stalwart/logs/stalwart.log
 ```
 
 **Configuration error types** (see `crates/utils/src/config/mod.rs:log_errors()`):
@@ -320,7 +320,7 @@ sudo chmod 644 /opt/stalwart/certs/fullchain.pem
 sudo chmod 600 /opt/stalwart/certs/privkey.pem  # Private key should be restrictive
 ```
 
-**Note:** Unlike sendmail, Stalwart does **not** reject certificates with overly permissive permissions (e.g., world-readable). However, best practice is to restrict private key access to 600.
+**Note:** Stalwart does **not** reject certificates with overly permissive permissions (e.g., world-readable). However, best practice is to restrict private key access to 600.
 
 #### 3. Wrong File Path
 
