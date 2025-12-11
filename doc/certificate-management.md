@@ -506,6 +506,53 @@ You must configure Stalwart to trust the proxy protocol headers from your server
 
 **See also:** [Proxy Protocol Documentation](https://stalw.art/docs/server/reverse-proxy/proxy-protocol/) for complete details.
 
+#### 8. Self-Signed Certificate Fallback
+
+**Important to know:** If your certificates fail to load or are misconfigured, Stalwart will **not crash**. Instead, it falls back to a self-signed certificate to keep the service running.
+
+**How It Works:**
+
+When Stalwart starts up, it generates a self-signed certificate as a fallback (see `crates/common/src/config/inner.rs:53-61`):
+
+1. **First attempt**: Generate self-signed cert with all the SANs from your configured certificates
+2. **If that fails**: Generate a fallback self-signed cert for "localhost"
+3. **Store as backup**: Kept in memory as `tls_self_signed_cert`
+
+**When the Fallback Is Used:**
+
+If no valid certificates are loaded (see `crates/common/src/listener/tls.rs:90-96`):
+- Stalwart logs event: `NoCertificatesAvailable`
+- Uses the self-signed certificate for all TLS connections
+- **Service continues to run** (no crash)
+
+**What You'll See:**
+
+```bash
+# Check logs for this event
+journalctl -u stalwart -n 500 | grep -i "NoCertificatesAvailable"
+```
+
+**Client Impact:**
+- Email clients will show certificate warnings/errors
+- Connections will work, but clients won't trust the certificate
+- Users will see "self-signed certificate" or "untrusted certificate" errors
+
+**What To Do:**
+
+If you see `NoCertificatesAvailable` events:
+1. Check your certificate configuration for errors (see Debug Checklist below)
+2. Verify certificate files exist and are readable
+3. Check logs for MacroError or ParseError messages
+4. Fix the certificate configuration
+5. Reload: `stalwart-cli server reload-certificates`
+
+The self-signed fallback ensures your mail server stays operational while you fix certificate issues, but you should resolve the underlying problem as soon as possible.
+
+**Implementation Details:**
+- **Self-signed generation**: `crates/common/src/config/inner.rs:53-61`
+- **Fallback selection logic**: `crates/common/src/listener/tls.rs:90-96`
+- **Build function**: `crates/common/src/config/server/tls.rs:444-453`
+
 ### Debug Checklist
 
 When certificates aren't loading, check in this order:
