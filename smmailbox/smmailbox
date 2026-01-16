@@ -1,0 +1,4795 @@
+#!/usr/bin/env python3
+"""
+smmailbox: Stalwart migration helper (phase 1: IMAP/imapsync + Zimbra tag metadata export).
+
+Design goals:
+- Prefer a local CLI over exposing new network APIs.
+- Support --dry-run and --init (best-effort deps install for Debian/Ubuntu and RHEL-like distros).
+- Export Zimbra tags (SOAP) and map them to IMAP keywords so imapsync-preserved tags can be
+  correlated with the original pretty names/colors.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import copy
+import csv
+import getpass
+import json
+import os
+import re
+import shlex
+import shutil
+import ssl
+import subprocess
+import sys
+import tempfile
+import textwrap
+import urllib.error
+import urllib.request
+from urllib.parse import quote, urlsplit
+import uuid
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Iterable, Optional
+
+import imaplib
+from zoneinfo import ZoneInfo
+
+
+__version__ = "0.1.0"
+__maintainer__ = "J Dunphy"
+__license__ = "MIT"
+__ai_assistance__ = "OpenAI Codex (GPT-5.2)"
+
+
+def eprint(*args: object) -> None:
+    print(*args, file=sys.stderr)
+
+
+def read_text_file(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def which(cmd: str) -> Optional[str]:
+    return shutil.which(cmd)
+
+
+def parse_os_release() -> dict[str, str]:
+    path = Path("/etc/os-release")
+    if not path.exists():
+        return {}
+    out: dict[str, str] = {}
+    for line in read_text_file(path).splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        out[k] = v.strip().strip('"')
+    return out
+
+
+def detect_pkg_manager() -> Optional[str]:
+    for candidate in ("apt-get", "dnf", "yum"):
+        if which(candidate):
+            return candidate
+    return None
+
+
+def install_imapsync_from_source_apt(*, dry_run: bool) -> bool:
+    imapsync_dir = Path(os.environ.get("IMAPSYNC_DIR", str(Path.home() / "imapsync"))).expanduser()
+    run_tests = os.environ.get("IMAPSYNC_TESTSLIVE", "0") == "1"
+
+    packages = [
+        "git",
+        "make",
+        "cpanminus",
+        "libauthen-ntlm-perl",
+        "libclass-load-perl",
+        "libcrypt-ssleay-perl",
+        "libdata-uniqid-perl",
+        "libdigest-hmac-perl",
+        "libdist-checkconflicts-perl",
+        "libencode-imaputf7-perl",
+        "libfile-copy-recursive-perl",
+        "libfile-tail-perl",
+        "libio-compress-perl",
+        "libio-socket-inet6-perl",
+        "libio-socket-ssl-perl",
+        "libio-tee-perl",
+        "libmail-imapclient-perl",
+        "libmodule-scandeps-perl",
+        "libnet-dbus-perl",
+        "libnet-ssleay-perl",
+        "libpar-packer-perl",
+        "libreadonly-perl",
+        "libregexp-common-perl",
+        "libsys-meminfo-perl",
+        "libterm-readkey-perl",
+        "libtest-deep-perl",
+        "libtest-fatal-perl",
+        "libtest-mock-guard-perl",
+        "libtest-mockobject-perl",
+        "libtest-nowarnings-perl",
+        "libtest-pod-perl",
+        "libtest-requires-perl",
+        "libtest-simple-perl",
+        "libtest-warn-perl",
+        "libunicode-string-perl",
+        "liburi-perl",
+    ]
+
+    run(["sudo", "apt-get", "update"], dry_run=dry_run, check=False)
+    run(
+        ["sudo", "apt-get", "install", "-y", *packages],
+        dry_run=dry_run,
+        check=False,
+    )
+
+    if imapsync_dir.exists() and (imapsync_dir / ".git").exists():
+        run(["git", "-C", str(imapsync_dir), "pull", "--ff-only"], dry_run=dry_run, check=False)
+    else:
+        run(
+            ["git", "clone", "https://github.com/imapsync/imapsync.git", str(imapsync_dir)],
+            dry_run=dry_run,
+            check=False,
+        )
+
+    run(
+        ["sudo", "ln", "-sf", str(imapsync_dir / "imapsync"), "/usr/local/bin/imapsync"],
+        dry_run=dry_run,
+        check=False,
+    )
+    run(["imapsync", "--version"], dry_run=dry_run, check=False)
+    if run_tests:
+        run(["imapsync", "--testslive"], dry_run=dry_run, check=False)
+
+    return dry_run or which("imapsync") is not None
+
+
+def apt_has_universe_enabled() -> bool:
+    sources: list[Path] = [Path("/etc/apt/sources.list")]
+    sources_dir = Path("/etc/apt/sources.list.d")
+    if sources_dir.exists():
+        sources.extend(sorted(sources_dir.glob("*.list")))
+        sources.extend(sorted(sources_dir.glob("*.sources")))
+
+    for path in sources:
+        if not path.exists():
+            continue
+        text = read_text_file(path)
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            # deb822 format uses "Components: main universe"
+            if line.lower().startswith("components:") and "universe" in line.lower():
+                return True
+            # classic sources.list format: "deb ... jammy main universe"
+            if line.lower().startswith(("deb ", "deb-src ")) and re.search(r"\buniverse\b", line, re.I):
+                return True
+    return False
+
+
+def shell_join(argv: list[str]) -> str:
+    return " ".join(shlex.quote(x) for x in argv)
+
+
+def chunks(items: list[str], size: int) -> Iterable[list[str]]:
+    size = max(1, int(size))
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+def run(argv: list[str], *, dry_run: bool, check: bool = True) -> int:
+    cmdline = shell_join(argv)
+    print(cmdline)
+    if dry_run:
+        return 0
+    proc = subprocess.run(argv)
+    if check and proc.returncode != 0:
+        raise SystemExit(proc.returncode)
+    return proc.returncode
+
+
+IMAPSYNC_ERROR_RE = re.compile(r"\b(error|failed|fatal)\b", re.IGNORECASE)
+IMAPSYNC_LOGFILE_RE = re.compile(r"^Log file is\s+(\S+)\s+\(", re.IGNORECASE)
+IMAPSYNC_FOLDERS_SYNCED_RE = re.compile(r"^Folders synced\s*:\s*(\d+)\s*/\s*(\d+)\s+synced", re.IGNORECASE)
+IMAPSYNC_MESSAGES_TRANSFERRED_RE = re.compile(r"^Messages transferred\s*:\s*(\d+)\b", re.IGNORECASE)
+IMAPSYNC_MESSAGES_SKIPPED_RE = re.compile(r"^Messages skipped\s*:\s*(\d+)\b", re.IGNORECASE)
+IMAPSYNC_DETECTED_ERRORS_RE = re.compile(r"^Detected\s+(\d+)\s+errors\b", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class ImapsyncResult:
+    returncode: int
+    logfile: Optional[str] = None
+    folders_synced: Optional[tuple[int, int]] = None
+    messages_transferred: Optional[int] = None
+    messages_skipped: Optional[int] = None
+    errors: Optional[int] = None
+
+
+def imapsync_summary_detail(res: ImapsyncResult) -> str:
+    parts: list[str] = []
+    if res.folders_synced is not None:
+        a, b = res.folders_synced
+        parts.append(f"folders={a}/{b}")
+    if res.messages_transferred is not None:
+        parts.append(f"xfer={res.messages_transferred}")
+    if res.messages_skipped is not None:
+        parts.append(f"skipped={res.messages_skipped}")
+    if res.errors is not None:
+        parts.append(f"errors={res.errors}")
+    return " ".join(parts)
+IMAPSYNC_KEEP_RE = re.compile(
+    r"^(?:"  # keep these imapsync stdout lines by default:
+    r"\+{4}\s"  # section headers
+    r"|Folder\s+"  # folder progress
+    r"|Creating folder\b"
+    r"|Created folder\b"
+    r"|Transfer (?:started|ended)\b"
+    r"|Log file is\b"
+    r"|Messages (?:transferred|skipped)\b"
+    r"|Folders synced\b"
+    r"|Detected \d+ errors\b"
+    r"|Exiting with return value\b"
+    r"|The sync\b"
+    r")"
+)
+
+
+def should_print_imapsync_line(line: str) -> bool:
+    line = line.rstrip("\r\n")
+    if not line:
+        return False
+    if line.startswith("msg "):
+        # Too verbose for large mailboxes; keep folder-level progress only.
+        return False
+    if IMAPSYNC_ERROR_RE.search(line):
+        return True
+    return bool(IMAPSYNC_KEEP_RE.match(line))
+
+
+def run_imapsync(argv: list[str], *, verbose: bool) -> ImapsyncResult:
+    """
+    Run imapsync:
+    - verbose=True: passthrough stdout/stderr (full imapsync output)
+    - verbose=False: filter stdout to show only high-level progress + summary
+    """
+    if verbose:
+        print(shell_join(argv))
+
+    proc = subprocess.Popen(  # noqa: S603
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+
+    logfile: Optional[str] = None
+    folders_synced: Optional[tuple[int, int]] = None
+    messages_transferred: Optional[int] = None
+    messages_skipped: Optional[int] = None
+    errors: Optional[int] = None
+    for raw_line in proc.stdout:
+        line = raw_line.rstrip("\r\n")
+        m = IMAPSYNC_LOGFILE_RE.match(line)
+        if m:
+            logfile = m.group(1)
+
+        m = IMAPSYNC_FOLDERS_SYNCED_RE.match(line)
+        if m:
+            folders_synced = (int(m.group(1)), int(m.group(2)))
+
+        m = IMAPSYNC_MESSAGES_TRANSFERRED_RE.match(line)
+        if m:
+            messages_transferred = int(m.group(1))
+
+        m = IMAPSYNC_MESSAGES_SKIPPED_RE.match(line)
+        if m:
+            messages_skipped = int(m.group(1))
+
+        m = IMAPSYNC_DETECTED_ERRORS_RE.match(line)
+        if m:
+            errors = int(m.group(1))
+
+        if verbose or should_print_imapsync_line(line):
+            print(line)
+    proc.stdout.close()
+    rc = proc.wait()
+    if rc != 0:
+        raise SystemExit(rc)
+    return ImapsyncResult(
+        returncode=rc,
+        logfile=logfile,
+        folders_synced=folders_synced,
+        messages_transferred=messages_transferred,
+        messages_skipped=messages_skipped,
+        errors=errors,
+    )
+
+
+def require_command(cmd: str, hint: str) -> None:
+    if which(cmd):
+        return
+    raise SystemExit(f"Missing required command: {cmd}\n\n{hint}\n")
+
+
+def load_secret(
+    *,
+    label: str,
+    value: Optional[str],
+    env: Optional[str],
+    file: Optional[str],
+    prompt: bool,
+) -> str:
+    if value is not None:
+        return value
+    if env:
+        v = os.environ.get(env)
+        if v:
+            return v
+        raise SystemExit(f"{label}: env var not set: {env}")
+    if file:
+        p = Path(file)
+        if not p.exists():
+            raise SystemExit(f"{label}: password file not found: {file}")
+        return read_text_file(p).splitlines()[0].rstrip("\n")
+    if prompt:
+        return getpass.getpass(f"{label}: ")
+    raise SystemExit(
+        f"{label}: missing secret (use --{label.lower().replace(' ', '-')}-env/--...-file or --prompt)"
+    )
+
+
+def build_ssl_context(*, verify: bool) -> ssl.SSLContext:
+    if verify:
+        return ssl.create_default_context()
+    ctx = ssl._create_unverified_context()  # noqa: SLF001
+    return ctx
+
+
+def http_post_xml(url: str, xml_bytes: bytes, *, verify_tls: bool) -> bytes:
+    req = urllib.request.Request(
+        url=url,
+        data=xml_bytes,
+        method="POST",
+        headers={"Content-Type": "application/soap+xml"},
+    )
+    ctx = build_ssl_context(verify=verify_tls)
+    try:
+        with urllib.request.urlopen(req, context=ctx) as resp:  # noqa: S310
+            return resp.read()
+    except urllib.error.HTTPError as e:  # noqa: PERF203
+        body = e.read().decode("utf-8", errors="replace")
+        raise SystemExit(f"HTTP {e.code} from {url}\n{body}\n") from e
+    except urllib.error.URLError as e:
+        raise SystemExit(f"Failed to reach {url}: {e}\n") from e
+
+
+def http_get_json(url: str, *, headers: dict[str, str], verify_tls: bool) -> dict:
+    req = urllib.request.Request(url=url, method="GET", headers=headers)
+    ctx = build_ssl_context(verify=verify_tls)
+    try:
+        with urllib.request.urlopen(req, context=ctx) as resp:  # noqa: S310
+            body = resp.read().decode("utf-8", errors="replace")
+            try:
+                return json.loads(body)
+            except Exception as e:  # noqa: BLE001
+                raise SystemExit(f"Failed to parse JSON from {url}: {e}\n{body}\n") from e
+    except urllib.error.HTTPError as e:  # noqa: PERF203
+        body = e.read().decode("utf-8", errors="replace")
+        raise SystemExit(f"HTTP {e.code} from {url}\n{body}\n") from e
+    except urllib.error.URLError as e:
+        raise SystemExit(f"Failed to reach {url}: {e}\n") from e
+
+
+def http_post_json(url: str, body: dict, *, headers: dict[str, str], verify_tls: bool) -> dict:
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url=url,
+        data=data,
+        method="POST",
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Accept": "application/json",
+            **headers,
+        },
+    )
+    ctx = build_ssl_context(verify=verify_tls)
+    try:
+        with urllib.request.urlopen(req, context=ctx) as resp:  # noqa: S310
+            raw = resp.read().decode("utf-8", errors="replace")
+            try:
+                return json.loads(raw)
+            except Exception as e:  # noqa: BLE001
+                raise SystemExit(f"Failed to parse JSON from {url}: {e}\n{raw}\n") from e
+    except urllib.error.HTTPError as e:  # noqa: PERF203
+        body = e.read().decode("utf-8", errors="replace")
+        raise SystemExit(f"HTTP {e.code} from {url}\n{body}\n") from e
+    except urllib.error.URLError as e:
+        raise SystemExit(f"Failed to reach {url}: {e}\n") from e
+
+
+def http_get_bytes(url: str, *, headers: dict[str, str], verify_tls: bool) -> bytes:
+    req = urllib.request.Request(
+        url=url,
+        method="GET",
+        headers={"Accept": "*/*", **headers},
+    )
+    ctx = build_ssl_context(verify=verify_tls)
+    try:
+        with urllib.request.urlopen(req, context=ctx) as resp:  # noqa: S310
+            return resp.read()
+    except urllib.error.HTTPError as e:  # noqa: PERF203
+        body = e.read().decode("utf-8", errors="replace")
+        raise SystemExit(f"HTTP {e.code} from {url}\n{body}\n") from e
+    except urllib.error.URLError as e:
+        raise SystemExit(f"Failed to reach {url}: {e}\n") from e
+
+
+def basic_auth_header(username: str, password: str) -> str:
+    token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+    return f"Basic {token}"
+
+
+def zimbra_soap_auth_token(
+    soap_url: str, *, username: str, password: str, verify_tls: bool
+) -> str:
+    envelope = f"""\
+<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope">
+  <soap:Body>
+    <AuthRequest xmlns="urn:zimbraAccount">
+      <account by="name">{xml_escape(username)}</account>
+      <password>{xml_escape(password)}</password>
+    </AuthRequest>
+  </soap:Body>
+</soap:Envelope>
+"""
+    raw = http_post_xml(soap_url, envelope.encode("utf-8"), verify_tls=verify_tls)
+    try:
+        root = ET.fromstring(raw)  # noqa: S314
+    except ET.ParseError as e:
+        raise SystemExit(f"Failed to parse SOAP auth response: {e}\n") from e
+
+    # authToken can be in any namespace; search by local-name.
+    token_el = root.find(".//{*}authToken")
+    if token_el is None or not (token_el.text and token_el.text.strip()):
+        raise SystemExit("Auth succeeded but no <authToken> found in response\n")
+    return token_el.text.strip()
+
+
+@dataclass(frozen=True)
+class ZimbraTag:
+    soap_id: str
+    name: str
+    color: Optional[str]
+
+
+def zimbra_soap_get_tags(soap_url: str, *, auth_token: str, verify_tls: bool) -> list[ZimbraTag]:
+    envelope = f"""\
+<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope">
+  <soap:Header>
+    <context xmlns="urn:zimbra">
+      <authToken>{xml_escape(auth_token)}</authToken>
+    </context>
+  </soap:Header>
+  <soap:Body>
+    <GetTagRequest xmlns="urn:zimbraMail"/>
+  </soap:Body>
+</soap:Envelope>
+"""
+    raw = http_post_xml(soap_url, envelope.encode("utf-8"), verify_tls=verify_tls)
+    try:
+        root = ET.fromstring(raw)  # noqa: S314
+    except ET.ParseError as e:
+        raise SystemExit(f"Failed to parse SOAP tags response: {e}\n") from e
+
+    tags: list[ZimbraTag] = []
+    for tag_el in root.findall(".//{*}tag"):
+        soap_id = (tag_el.attrib.get("id") or "").strip()
+        name = (tag_el.attrib.get("name") or "").strip()
+        color = (tag_el.attrib.get("color") or "").strip() or None
+        if not soap_id or not name:
+            continue
+        tags.append(ZimbraTag(soap_id=soap_id, name=name, color=color))
+    return tags
+
+
+def xml_local_name(tag: str) -> str:
+    # "{namespace}local" -> "local"
+    if "}" in tag:
+        return tag.rsplit("}", 1)[-1]
+    return tag
+
+
+def zimbra_truthy(raw: Optional[str]) -> bool:
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def xml_element_to_obj(el: ET.Element) -> dict:
+    out: dict[str, object] = {}
+    for k, v in el.attrib.items():
+        out[k] = v
+    if el.text and el.text.strip():
+        out["_content"] = el.text.strip()
+    for child in list(el):
+        key = xml_local_name(child.tag)
+        out.setdefault(key, [])
+        assert isinstance(out[key], list)
+        out[key].append(xml_element_to_obj(child))
+    return out
+
+
+def zimbra_soap_get_filter_rules(
+    soap_url: str,
+    *,
+    auth_token: str,
+    verify_tls: bool,
+    outgoing: bool = False,
+) -> list[dict]:
+    request_name = "GetOutgoingFilterRulesRequest" if outgoing else "GetFilterRulesRequest"
+    envelope = f"""\
+<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope">
+  <soap:Header>
+    <context xmlns="urn:zimbra">
+      <authToken>{xml_escape(auth_token)}</authToken>
+    </context>
+  </soap:Header>
+  <soap:Body>
+    <{request_name} xmlns="urn:zimbraMail"/>
+  </soap:Body>
+</soap:Envelope>
+"""
+    raw = http_post_xml(soap_url, envelope.encode("utf-8"), verify_tls=verify_tls)
+    try:
+        root = ET.fromstring(raw)  # noqa: S314
+    except ET.ParseError as e:
+        raise SystemExit(f"Failed to parse SOAP filter rules response: {e}\n") from e
+
+    filter_rules_el = root.find(".//{*}filterRules")
+    if filter_rules_el is None:
+        return []
+
+    out: list[dict] = []
+    for rule_el in filter_rules_el.findall("./{*}filterRule"):
+        name = (rule_el.attrib.get("name") or "").strip()
+        if not name:
+            continue
+
+        rule: dict[str, object] = {"name": name}
+        active_raw = rule_el.attrib.get("active")
+        rule["active"] = True if active_raw is None else zimbra_truthy(active_raw)
+
+        # filterTests: group child test nodes under their element name as arrays.
+        tests_groups: list[dict] = []
+        for tests_el in rule_el.findall("./{*}filterTests"):
+            group: dict[str, object] = {}
+            cond = (tests_el.attrib.get("condition") or "").strip()
+            if cond:
+                group["condition"] = cond
+            for child in list(tests_el):
+                key = xml_local_name(child.tag)
+                group.setdefault(key, [])
+                assert isinstance(group[key], list)
+                group[key].append(xml_element_to_obj(child))
+            if group:
+                tests_groups.append(group)
+        if tests_groups:
+            rule["filterTests"] = tests_groups
+
+        actions_groups: list[dict] = []
+        for actions_el in rule_el.findall("./{*}filterActions"):
+            group = {}
+            for child in list(actions_el):
+                key = xml_local_name(child.tag)
+                group.setdefault(key, [])
+                assert isinstance(group[key], list)
+                group[key].append(xml_element_to_obj(child))
+            if group:
+                actions_groups.append(group)
+        if actions_groups:
+            rule["filterActions"] = actions_groups
+
+        out.append(rule)
+
+    return out
+
+
+@dataclass(frozen=True)
+class ZimbraContactFolder:
+    folder_id: str
+    name: str
+    abs_folder_path: str
+
+
+@dataclass(frozen=True)
+class ZimbraContact:
+    contact_id: str
+    folder_id: Optional[str]
+    attrs: dict[str, str]
+
+
+def zimbra_soap_get_contact_folders(
+    soap_url: str,
+    *,
+    auth_token: str,
+    verify_tls: bool,
+) -> list[ZimbraContactFolder]:
+    envelope = f"""\
+<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope">
+  <soap:Header>
+    <context xmlns="urn:zimbra">
+      <authToken>{xml_escape(auth_token)}</authToken>
+    </context>
+  </soap:Header>
+  <soap:Body>
+    <GetFolderRequest xmlns="urn:zimbraMail" view="contact"/>
+  </soap:Body>
+</soap:Envelope>
+"""
+    raw = http_post_xml(soap_url, envelope.encode("utf-8"), verify_tls=verify_tls)
+    try:
+        root = ET.fromstring(raw)  # noqa: S314
+    except ET.ParseError as e:
+        raise SystemExit(f"Failed to parse SOAP GetFolderResponse: {e}\n") from e
+
+    out: list[ZimbraContactFolder] = []
+    for folder_el in root.findall(".//{*}folder"):
+        view = (folder_el.attrib.get("view") or "").strip().lower()
+        if view != "contact":
+            continue
+        folder_id = (folder_el.attrib.get("id") or "").strip()
+        name = (folder_el.attrib.get("name") or "").strip()
+        abs_path = (folder_el.attrib.get("absFolderPath") or "").strip()
+        if not folder_id or not name:
+            continue
+        out.append(
+            ZimbraContactFolder(folder_id=folder_id, name=name, abs_folder_path=abs_path or f"/{name}")
+        )
+    return out
+
+
+def zimbra_soap_search_contact_ids(
+    soap_url: str,
+    *,
+    auth_token: str,
+    folder_id: str,
+    limit: int,
+    offset: int,
+    verify_tls: bool,
+) -> tuple[list[str], bool]:
+    query = f"inid:{folder_id}"
+    envelope = f"""\
+<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope">
+  <soap:Header>
+    <context xmlns="urn:zimbra">
+      <authToken>{xml_escape(auth_token)}</authToken>
+    </context>
+  </soap:Header>
+  <soap:Body>
+    <SearchRequest xmlns="urn:zimbraMail" types="contact" resultMode="IDS"
+        query="{xml_escape(query)}" limit="{limit}" offset="{offset}" sortBy="nameAsc"/>
+  </soap:Body>
+</soap:Envelope>
+"""
+    raw = http_post_xml(soap_url, envelope.encode("utf-8"), verify_tls=verify_tls)
+    try:
+        root = ET.fromstring(raw)  # noqa: S314
+    except ET.ParseError as e:
+        raise SystemExit(f"Failed to parse SOAP SearchResponse: {e}\n") from e
+
+    resp_el = root.find(".//{*}SearchResponse")
+    if resp_el is None:
+        raise SystemExit("SOAP SearchResponse missing in response\n")
+
+    ids: list[str] = []
+
+    for hit in resp_el.findall(".//{*}hit"):
+        cid = (hit.attrib.get("id") or "").strip()
+        if cid:
+            ids.append(cid)
+
+    # Some servers may return <cn id="..."> entries for contact searches.
+    for cn in resp_el.findall(".//{*}cn"):
+        cid = (cn.attrib.get("id") or "").strip()
+        if cid:
+            ids.append(cid)
+
+    more = zimbra_truthy(resp_el.attrib.get("more"))
+
+    # Deduplicate while preserving order.
+    seen: set[str] = set()
+    unique: list[str] = []
+    for cid in ids:
+        if cid in seen:
+            continue
+        seen.add(cid)
+        unique.append(cid)
+
+    return (unique, more)
+
+
+def zimbra_soap_get_contacts_by_ids(
+    soap_url: str,
+    *,
+    auth_token: str,
+    ids: list[str],
+    verify_tls: bool,
+) -> list[ZimbraContact]:
+    if not ids:
+        return []
+
+    cn_xml = "\n".join([f'<cn id="{xml_escape(cid)}"/>' for cid in ids])
+    envelope = f"""\
+<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope">
+  <soap:Header>
+    <context xmlns="urn:zimbra">
+      <authToken>{xml_escape(auth_token)}</authToken>
+    </context>
+  </soap:Header>
+  <soap:Body>
+    <GetContactsRequest xmlns="urn:zimbraMail">
+      {cn_xml}
+    </GetContactsRequest>
+  </soap:Body>
+</soap:Envelope>
+"""
+    raw = http_post_xml(soap_url, envelope.encode("utf-8"), verify_tls=verify_tls)
+    try:
+        root = ET.fromstring(raw)  # noqa: S314
+    except ET.ParseError as e:
+        raise SystemExit(f"Failed to parse SOAP GetContactsResponse: {e}\n") from e
+
+    out: list[ZimbraContact] = []
+    for cn in root.findall(".//{*}cn"):
+        cid = (cn.attrib.get("id") or "").strip()
+        if not cid:
+            continue
+        folder_id = (cn.attrib.get("l") or "").strip() or None
+        attrs: dict[str, str] = {}
+        for a in cn.findall("./{*}a"):
+            name = (a.attrib.get("n") or "").strip()
+            if not name:
+                continue
+            # Zimbra may include empty values; preserve them (we may want to clear fields).
+            value = (a.text or "").strip()
+            attrs[name] = value
+        out.append(ZimbraContact(contact_id=cid, folder_id=folder_id, attrs=attrs))
+    return out
+
+
+def zimbra_date_to_partial_date(date: str) -> Optional[dict]:
+    date = date.strip()
+    if not date:
+        return None
+    if date.startswith("--"):
+        rest = date[2:]
+        if "-" not in rest:
+            return None
+        month, day = rest.split("-", 1)
+        try:
+            return {"@type": "PartialDate", "month": int(month), "day": int(day)}
+        except ValueError:
+            return None
+    if "-" not in date:
+        return None
+    year, rest = date.split("-", 1)
+    if "-" not in rest:
+        return None
+    month, day = rest.split("-", 1)
+    try:
+        return {"@type": "PartialDate", "year": int(year), "month": int(month), "day": int(day)}
+    except ValueError:
+        return None
+
+
+def jscontact_join_nonempty(parts: list[str]) -> str:
+    return " ".join([p.strip() for p in parts if p.strip()])
+
+
+def jscontact_name_object(
+    *, prefix: str, first: str, middle: str, last: str, suffix: str, full: str
+) -> Optional[dict]:
+    prefix = prefix.strip()
+    first = first.strip()
+    middle = middle.strip()
+    last = last.strip()
+    suffix = suffix.strip()
+    full = full.strip()
+    if not any([prefix, first, middle, last, suffix, full]):
+        return None
+
+    out: dict[str, object] = {}
+    if full:
+        out["full"] = full
+
+    components: list[dict[str, str]] = []
+    if last:
+        components.append({"kind": "surname", "value": last})
+    if first:
+        components.append({"kind": "given", "value": first})
+    if middle:
+        components.append({"kind": "given2", "value": middle})
+    if prefix:
+        components.append({"kind": "title", "value": prefix})
+    if suffix:
+        components.append({"kind": "credential", "value": suffix})
+    if components:
+        out["components"] = components
+        out["isOrdered"] = True
+
+    return out
+
+
+def jscontact_name_from_attrs(attrs: dict[str, str]) -> Optional[dict]:
+    prefix = attrs.get("namePrefix", "")
+    first = attrs.get("firstName", "")
+    middle = attrs.get("middleName", "")
+    last = attrs.get("lastName", "")
+    suffix = attrs.get("nameSuffix", "")
+    full = attrs.get("fullName", "").strip()
+    if not full:
+        full = jscontact_join_nonempty([prefix, first, middle, last, suffix]).strip()
+    if not full:
+        email = attrs.get("email", "").strip()
+        if email:
+            full = email
+    if not full:
+        company = attrs.get("company", "").strip()
+        if company:
+            full = company
+    return jscontact_name_object(prefix=prefix, first=first, middle=middle, last=last, suffix=suffix, full=full)
+
+
+def is_zimbra_email_field(field: str) -> bool:
+    if field == "email" or field == "workEmail":
+        return True
+    if field.startswith("email") and field != "email":
+        rest = field[len("email") :]
+        return rest.isdigit()
+    if field.startswith("workEmail") and field != "workEmail":
+        rest = field[len("workEmail") :]
+        return rest.isdigit()
+    return False
+
+
+def jscontact_contexts_for_email_field(field: str) -> dict[str, bool]:
+    if field.startswith("workEmail"):
+        return {"work": True}
+    return {"private": True}
+
+
+def jscontact_emails_from_attrs(attrs: dict[str, str]) -> Optional[dict]:
+    out: dict[str, object] = {}
+    for field, value in attrs.items():
+        if not is_zimbra_email_field(field):
+            continue
+        address = value.strip()
+        if not address:
+            continue
+        out[field] = {"address": address, "contexts": jscontact_contexts_for_email_field(field)}
+    return out or None
+
+
+def is_zimbra_phone_field(field: str) -> bool:
+    base_fields = [
+        "mobilePhone",
+        "workPhone",
+        "workFax",
+        "companyPhone",
+        "homePhone",
+        "homeFax",
+        "pager",
+        "callbackPhone",
+        "assistantPhone",
+        "carPhone",
+        "otherPhone",
+        "otherFax",
+        "workAltPhone",
+        "workMobile",
+    ]
+    for base in base_fields:
+        if field == base:
+            return True
+        if field.startswith(base):
+            rest = field[len(base) :]
+            if rest and rest.isdigit():
+                return True
+    return False
+
+
+def jscontact_phone_entry(field: str, number: str) -> Optional[dict]:
+    number = number.strip()
+    if not number:
+        return None
+
+    contexts: dict[str, bool] = {}
+    if field.startswith("work") or field == "companyPhone":
+        contexts["work"] = True
+    elif field.startswith("home") or field == "mobilePhone":
+        contexts["private"] = True
+    elif field.startswith("other"):
+        contexts["other"] = True
+
+    features: dict[str, bool] = {}
+    lower = field.lower()
+    if "fax" in lower:
+        features["fax"] = True
+    elif field == "pager":
+        features["pager"] = True
+    elif "mobile" in lower:
+        features["cell"] = True
+        features["voice"] = True
+    else:
+        features["voice"] = True
+
+    entry: dict[str, object] = {"number": number, "features": features}
+    if contexts:
+        entry["contexts"] = contexts
+    return entry
+
+
+def jscontact_phones_from_attrs(attrs: dict[str, str]) -> Optional[dict]:
+    out: dict[str, object] = {}
+    for field, value in attrs.items():
+        if not is_zimbra_phone_field(field):
+            continue
+        entry = jscontact_phone_entry(field, value)
+        if entry is None:
+            continue
+        out[field] = entry
+    return out or None
+
+
+def jscontact_links_from_attrs(attrs: dict[str, str]) -> Optional[dict]:
+    out: dict[str, object] = {}
+    for field in ["homeURL", "workURL", "otherURL"]:
+        uri = attrs.get(field)
+        if not uri:
+            continue
+        uri = uri.strip()
+        if not uri:
+            continue
+        contexts = {"private": True}
+        if field == "workURL":
+            contexts = {"work": True}
+        elif field == "otherURL":
+            contexts = {"other": True}
+        out[field] = {"uri": uri, "contexts": contexts}
+    return out or None
+
+
+def jscontact_nicknames_from_attrs(attrs: dict[str, str]) -> Optional[dict]:
+    nickname = attrs.get("nickname", "").strip()
+    if not nickname:
+        return None
+    return {"nickname": {"name": nickname}}
+
+
+def jscontact_notes_from_attrs(attrs: dict[str, str]) -> Optional[dict]:
+    note = attrs.get("notes", "").strip()
+    if not note:
+        return None
+    return {"notes": {"note": note}}
+
+
+def jscontact_organizations_from_attrs(attrs: dict[str, str]) -> Optional[dict]:
+    company = attrs.get("company", "").strip()
+    department = attrs.get("department", "").strip()
+    if not company and not department:
+        return None
+    name = company if company else department
+    org: dict[str, object] = {"name": name}
+    if department:
+        org["units"] = [{"name": department}]
+    return {"company": org}
+
+
+def jscontact_titles_from_attrs(attrs: dict[str, str]) -> Optional[dict]:
+    title = attrs.get("jobTitle", "").strip()
+    if not title:
+        return None
+    return {"jobTitle": {"name": title, "kind": "title"}}
+
+
+def jscontact_anniversaries_from_attrs(attrs: dict[str, str]) -> Optional[dict]:
+    out: dict[str, object] = {}
+    birthday = attrs.get("birthday")
+    if birthday:
+        date = zimbra_date_to_partial_date(birthday)
+        if date is not None:
+            out["birthday"] = {"date": date, "kind": "birth"}
+    anniversary = attrs.get("anniversary")
+    if anniversary:
+        date = zimbra_date_to_partial_date(anniversary)
+        if date is not None:
+            out["anniversary"] = {"date": date, "kind": "wedding"}
+    return out or None
+
+
+def jscontact_address_entry(
+    *,
+    context: str,
+    street: str,
+    city: str,
+    state: str,
+    postal_code: str,
+    country: str,
+) -> Optional[dict]:
+    street = street.strip()
+    city = city.strip()
+    state = state.strip()
+    postal_code = postal_code.strip()
+    country = country.strip()
+    if not any([street, city, state, postal_code, country]):
+        return None
+    contexts = {"private": True}
+    if context == "work":
+        contexts = {"work": True}
+    elif context == "other":
+        contexts = {"other": True}
+
+    components: list[dict[str, str]] = []
+    if street:
+        components.append({"kind": "name", "value": street})
+    if city:
+        components.append({"kind": "locality", "value": city})
+    if state:
+        components.append({"kind": "region", "value": state})
+    if postal_code:
+        components.append({"kind": "postcode", "value": postal_code})
+    if country:
+        components.append({"kind": "country", "value": country})
+
+    full_parts: list[str] = []
+    if street:
+        full_parts.append(street)
+    line2 = jscontact_join_nonempty([city, state, postal_code]).strip()
+    if line2:
+        full_parts.append(line2)
+    if country:
+        full_parts.append(country)
+    full = "\n".join(full_parts)
+
+    return {"contexts": contexts, "full": full, "components": components, "isOrdered": True}
+
+
+def jscontact_addresses_from_attrs(attrs: dict[str, str]) -> Optional[dict]:
+    out: dict[str, object] = {}
+
+    home = jscontact_address_entry(
+        context="home",
+        street=attrs.get("homeStreet", ""),
+        city=attrs.get("homeCity", ""),
+        state=attrs.get("homeState", ""),
+        postal_code=attrs.get("homePostalCode", ""),
+        country=attrs.get("homeCountry", ""),
+    )
+    if home is not None:
+        out["home"] = home
+
+    work = jscontact_address_entry(
+        context="work",
+        street=attrs.get("workStreet", ""),
+        city=attrs.get("workCity", ""),
+        state=attrs.get("workState", ""),
+        postal_code=attrs.get("workPostalCode", ""),
+        country=attrs.get("workCountry", ""),
+    )
+    if work is not None:
+        out["work"] = work
+
+    other = jscontact_address_entry(
+        context="other",
+        street=attrs.get("otherStreet", ""),
+        city=attrs.get("otherCity", ""),
+        state=attrs.get("otherState", ""),
+        postal_code=attrs.get("otherPostalCode", ""),
+        country=attrs.get("otherCountry", ""),
+    )
+    if other is not None:
+        out["other"] = other
+
+    return out or None
+
+
+def zimbra_contact_folder_to_address_book_name(folder: ZimbraContactFolder) -> str:
+    path = (folder.abs_folder_path or "").strip() or f"/{folder.name}"
+    path = path.lstrip("/")
+    if path.startswith("Contacts/"):
+        return path[len("Contacts/") :]
+    return folder.name
+
+
+@dataclass(frozen=True)
+class ZimbraCalendarFolder:
+    folder_id: str
+    name: str
+    abs_folder_path: str
+
+
+def zimbra_soap_get_calendar_folders(
+    soap_url: str,
+    *,
+    auth_token: str,
+    verify_tls: bool,
+) -> list[ZimbraCalendarFolder]:
+    envelope = f"""\
+<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope">
+  <soap:Header>
+    <context xmlns="urn:zimbra">
+      <authToken>{xml_escape(auth_token)}</authToken>
+    </context>
+  </soap:Header>
+  <soap:Body>
+    <GetFolderRequest xmlns="urn:zimbraMail" view="appointment"/>
+  </soap:Body>
+</soap:Envelope>
+"""
+    raw = http_post_xml(soap_url, envelope.encode("utf-8"), verify_tls=verify_tls)
+    try:
+        root = ET.fromstring(raw)  # noqa: S314
+    except ET.ParseError as e:
+        raise SystemExit(f"Failed to parse SOAP GetFolderResponse: {e}\n") from e
+
+    out: list[ZimbraCalendarFolder] = []
+    for folder_el in root.findall(".//{*}folder"):
+        view = (folder_el.attrib.get("view") or "").strip().lower()
+        if view != "appointment":
+            continue
+        folder_id = (folder_el.attrib.get("id") or "").strip()
+        name = (folder_el.attrib.get("name") or "").strip()
+        abs_path = (folder_el.attrib.get("absFolderPath") or "").strip()
+        if not folder_id or not name:
+            continue
+        out.append(
+            ZimbraCalendarFolder(
+                folder_id=folder_id,
+                name=name,
+                abs_folder_path=abs_path or f"/{name}",
+            )
+        )
+    return out
+
+
+def zimbra_calendar_folder_to_calendar_name(folder: ZimbraCalendarFolder) -> str:
+    path = (folder.abs_folder_path or "").strip() or f"/{folder.name}"
+    path = path.lstrip("/")
+    if path.startswith("Calendar/"):
+        return path[len("Calendar/") :]
+    return folder.name
+
+
+def zimbra_rest_export_ics(
+    *,
+    zimbra_host: str,
+    zimbra_user: str,
+    abs_folder_path: str,
+    auth_token: str,
+    verify_tls: bool,
+) -> bytes:
+    user_part = quote(zimbra_user, safe="")
+    folder_part = quote(abs_folder_path, safe="/")
+    if not folder_part.startswith("/"):
+        folder_part = "/" + folder_part
+    url = f"https://{zimbra_host}/home/{user_part}{folder_part}?fmt=ics"
+    return http_get_bytes(
+        url,
+        headers={"Cookie": f"ZM_AUTH_TOKEN={auth_token}"},
+        verify_tls=verify_tls,
+    )
+
+
+def parse_iso_datetime(value: str) -> datetime:
+    value = value.strip()
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    if "T" not in value:
+        # Date-only
+        return datetime.fromisoformat(value + "T00:00:00")
+    return datetime.fromisoformat(value)
+
+
+def jmap_local_datetime_to_utc(start: str, tzid: str) -> datetime:
+    dt = parse_iso_datetime(start)
+    if dt.tzinfo is None:
+        try:
+            tz = ZoneInfo(tzid)
+        except Exception:  # noqa: BLE001
+            tz = timezone.utc
+        dt = dt.replace(tzinfo=tz)
+    return dt.astimezone(timezone.utc)
+
+
+def jmap_default_calendar_id(cals: list[dict]) -> str:
+    for cal in cals:
+        if truthy(cal.get("isDefault")) and isinstance(cal.get("id"), str):
+            return cal["id"]
+    for cal in cals:
+        tz = cal.get("timeZone")
+        if isinstance(tz, str) and tz.strip() and isinstance(cal.get("id"), str):
+            return cal["id"]
+    for cal in cals:
+        if isinstance(cal.get("id"), str):
+            return cal["id"]
+    raise SystemExit("Destination calendars missing an id\n")
+
+
+def jmap_calendar_event_create_from_parsed(
+    parsed: dict, *, calendar_id: str, stable_uid: Optional[str]
+) -> dict:
+    start = parsed.get("start")
+    duration = parsed.get("duration")
+    if not isinstance(start, str) or not start.strip():
+        raise SystemExit("parsed calendar event missing start\n")
+    if not isinstance(duration, str) or not duration.strip():
+        raise SystemExit("parsed calendar event missing duration\n")
+
+    timezone_name = parsed.get("timeZone")
+    if not isinstance(timezone_name, str) or not timezone_name.strip():
+        timezone_name = "Etc/UTC"
+
+    create: dict[str, object] = {
+        "start": start.strip(),
+        "duration": duration.strip(),
+        "timeZone": timezone_name.strip(),
+        "calendarIds": {calendar_id: True},
+    }
+
+    title = parsed.get("title")
+    if isinstance(title, str) and title.strip():
+        create["title"] = title.strip()
+    description = parsed.get("description")
+    if isinstance(description, str) and description.strip():
+        create["description"] = description.strip()
+
+    # Preserve additional fields from the parsed event, but intentionally omit alerts to avoid
+    # migrating notification behavior (can be enabled later).
+    passthrough_keys = [
+        "uid",
+        "status",
+        "organizerCalendarAddress",
+        "participants",
+        "keywords",
+        "links",
+        "locations",
+        "recurrenceRules",
+        "recurrenceOverrides",
+        "excludedRecurrenceRules",
+        "excludedRecurrenceIds",
+        "showWithoutTime",
+        "isDraft",
+    ]
+    for key in passthrough_keys:
+        if key in parsed and key not in create:
+            create[key] = parsed[key]
+
+    if stable_uid:
+        create["uid"] = stable_uid
+
+    return create
+
+
+def calendar_event_dedupe_key(create_obj: dict) -> str:
+    """Key for 'equal event' dedupe within a single import run.
+
+    Intentionally ignores uid + calendarIds so two VEVENTs with different UID but otherwise
+    identical content can be treated as duplicates.
+    """
+
+    comparable = {k: v for k, v in create_obj.items() if k not in {"uid", "calendarIds"}}
+    return json.dumps(comparable, sort_keys=True, separators=(",", ":"))
+
+
+IMAP_FLAG_TOKEN_RE = re.compile(r"^(?P<stem>.+):FLAG(?P<num>[0-9]+)$")
+
+
+def canonical_tag_stem(name: str) -> str:
+    # Zimbra appears to remove spaces for IMAP keywords; we generalize to strip non-alphanumerics.
+    return re.sub(r"[^0-9A-Za-z]+", "", name)
+
+
+def safe_storage_key(raw: str) -> str:
+    out: list[str] = []
+    for ch in raw:
+        if ch.isascii() and (ch.isalnum() or ch in "-_"):
+            out.append(ch)
+        else:
+            out.append("_")
+    return "".join(out) or "unknown"
+
+
+def now_rfc3339_utc() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+@dataclass(frozen=True)
+class StalwartJmapSessionInfo:
+    api_url: str
+    api_host: Optional[str]
+    mail_account_id: Optional[str]
+    sieve_account_id: Optional[str]
+    contacts_account_id: Optional[str]
+
+
+def stalwart_jmap_session_info(
+    *,
+    base_url: str,
+    session_url: Optional[str],
+    username: str,
+    password: str,
+    verify_tls: bool,
+) -> StalwartJmapSessionInfo:
+    url = (session_url or (base_url.rstrip("/") + "/.well-known/jmap")).strip()
+    if not url:
+        raise SystemExit("Missing Stalwart JMAP session URL\n")
+
+    session = http_get_json(
+        url,
+        headers={
+            "Accept": "application/json",
+            "Authorization": basic_auth_header(username, password),
+        },
+        verify_tls=verify_tls,
+    )
+
+    api_url = session.get("apiUrl")
+    if not isinstance(api_url, str) or not api_url.strip():
+        raise SystemExit(f"Invalid JMAP session: missing apiUrl from {url}\n")
+    api_url = api_url.strip()
+
+    api_host = urlsplit(api_url).hostname if isinstance(api_url, str) else None
+
+    primary_accounts = session.get("primaryAccounts")
+    mail_account_id: Optional[str] = None
+    sieve_account_id: Optional[str] = None
+    contacts_account_id: Optional[str] = None
+    if isinstance(primary_accounts, dict):
+        mail_account_id = primary_accounts.get("urn:ietf:params:jmap:mail")
+        if not isinstance(mail_account_id, str):
+            mail_account_id = None
+
+        sieve_account_id = primary_accounts.get("urn:ietf:params:jmap:sieve")
+        if not isinstance(sieve_account_id, str):
+            sieve_account_id = None
+
+        contacts_account_id = primary_accounts.get("urn:ietf:params:jmap:contacts")
+        if not isinstance(contacts_account_id, str):
+            contacts_account_id = None
+
+    return StalwartJmapSessionInfo(
+        api_url=api_url,
+        api_host=api_host,
+        mail_account_id=mail_account_id,
+        sieve_account_id=sieve_account_id,
+        contacts_account_id=contacts_account_id,
+    )
+
+
+def stalwart_jmap_primary_mail_account(
+    *,
+    base_url: str,
+    session_url: Optional[str],
+    username: str,
+    password: str,
+    verify_tls: bool,
+) -> tuple[Optional[str], Optional[str]]:
+    """
+    Returns (api_host, mail_account_id).
+
+    - api_host is derived from the JMAP session `apiUrl`, and is used by Project-Z-Bridge to
+      compute its per-session storage key.
+    - mail_account_id is the JMAP primary mail accountId.
+    """
+    url = (session_url or (base_url.rstrip("/") + "/.well-known/jmap")).strip()
+    if not url:
+        return (None, None)
+
+    session = http_get_json(
+        url,
+        headers={
+            "Accept": "application/json",
+            "Authorization": basic_auth_header(username, password),
+        },
+        verify_tls=verify_tls,
+    )
+
+    api_url = session.get("apiUrl")
+    api_host = urlsplit(api_url).hostname if isinstance(api_url, str) else None
+
+    primary_accounts = session.get("primaryAccounts")
+    if not isinstance(primary_accounts, dict):
+        return (api_host, None)
+
+    mail_account_id = primary_accounts.get("urn:ietf:params:jmap:mail")
+    if not isinstance(mail_account_id, str):
+        return (api_host, None)
+
+    return (api_host, mail_account_id)
+
+
+ZBRIDGE_SIEVE_FILTER_RULES_COMMENT_PREFIX = "# Zbridge-FilterRules:"
+ZBRIDGE_SIEVE_MAIL_PREFS_COMMENT_PREFIX = "# Zbridge-MailPrefs:"
+
+
+def zbridge_decode_comment_json(script: str, *, prefix: str) -> Optional[dict]:
+    encoded = ""
+    prefix_lower = prefix.lower()
+    for line in script.splitlines():
+        trimmed = line.lstrip()
+        if not trimmed.lower().startswith(prefix_lower):
+            continue
+        encoded += trimmed[len(prefix) :].strip()
+    if not encoded:
+        return None
+    try:
+        raw = base64.b64decode(encoded)
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        obj = json.loads(raw.decode("utf-8", errors="strict"))
+    except Exception:  # noqa: BLE001
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def zbridge_encode_comment_chunks(obj: dict) -> list[str]:
+    raw = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    encoded = base64.b64encode(raw).decode("ascii")
+    chunk_len = 76
+    return [encoded[i : i + chunk_len] for i in range(0, len(encoded), chunk_len)]
+
+
+def zbridge_model_only_sieve_script(
+    *,
+    filter_model: dict,
+    mail_prefs: Optional[dict],
+    script_name: str,
+) -> str:
+    out = []
+    out.append("# Managed-by: zbridge")
+    out.append(f"# Script: {script_name}")
+    out.append("#")
+    if mail_prefs is not None:
+        for chunk in zbridge_encode_comment_chunks(mail_prefs):
+            out.append(f"{ZBRIDGE_SIEVE_MAIL_PREFS_COMMENT_PREFIX} {chunk}")
+        out.append("#")
+    for chunk in zbridge_encode_comment_chunks(filter_model):
+        out.append(f"{ZBRIDGE_SIEVE_FILTER_RULES_COMMENT_PREFIX} {chunk}")
+    out.append("#")
+    out.append("if false { keep; }")
+    return "\n".join(out) + "\n"
+
+
+def jmap_call(
+    *,
+    api_url: str,
+    username: str,
+    password: str,
+    request: dict,
+    verify_tls: bool,
+) -> dict:
+    return http_post_json(
+        api_url,
+        request,
+        headers={"Authorization": basic_auth_header(username, password)},
+        verify_tls=verify_tls,
+    )
+
+
+def jmap_get_call_result(resp: dict, *, call_id: str, expected: str) -> dict:
+    method_responses = resp.get("methodResponses")
+    if not isinstance(method_responses, list):
+        raise SystemExit("Invalid JMAP response: missing methodResponses\n")
+
+    for item in method_responses:
+        if not (isinstance(item, list) and len(item) == 3):
+            continue
+        method_name, payload, cid = item
+        if cid != call_id:
+            continue
+        if method_name == "error":
+            raise SystemExit(f"JMAP error for {call_id}: {json.dumps(payload, indent=2)}\n")
+        if method_name != expected:
+            raise SystemExit(
+                f"Unexpected JMAP response for {call_id}: got {method_name!r}, expected {expected!r}\n"
+            )
+        if not isinstance(payload, dict):
+            raise SystemExit(f"Invalid JMAP payload for {expected}: expected object\n")
+        return payload
+
+    raise SystemExit(f"Missing JMAP response for callId={call_id} ({expected})\n")
+
+
+def jmap_describe_set_error(error_obj: object) -> str:
+    if isinstance(error_obj, dict):
+        # Prefer a compact but useful summary.
+        typ = error_obj.get("type")
+        desc = error_obj.get("description")
+        if isinstance(typ, str) and isinstance(desc, str):
+            return f"{typ}: {desc}"
+    return json.dumps(error_obj, ensure_ascii=False)
+
+
+def jmap_set_expect_created_id(payload: dict) -> str:
+    created = payload.get("created")
+    if isinstance(created, dict):
+        if isinstance(created.get("k0"), dict) and isinstance(created["k0"].get("id"), str):
+            return created["k0"]["id"]
+        for _k, v in created.items():
+            if isinstance(v, dict) and isinstance(v.get("id"), str):
+                return v["id"]
+    not_created = payload.get("notCreated")
+    if isinstance(not_created, dict) and not_created:
+        first = not_created.get("k0")
+        if first is None:
+            first = next(iter(not_created.values()))
+        raise SystemExit(f"JMAP create failed: {jmap_describe_set_error(first)}\n")
+    raise SystemExit("JMAP set failed: missing created/notCreated\n")
+
+
+def jmap_set_expect_updated(payload: dict, *, id_: str) -> None:
+    updated = payload.get("updated")
+    if isinstance(updated, list):
+        if any(item == id_ for item in updated):
+            return
+    elif isinstance(updated, dict):
+        if id_ in updated:
+            return
+
+    not_updated = payload.get("notUpdated")
+    if isinstance(not_updated, dict) and not_updated:
+        err = not_updated.get(id_)
+        if err is None:
+            err = next(iter(not_updated.values()))
+        raise SystemExit(f"JMAP update failed: {jmap_describe_set_error(err)}\n")
+
+    raise SystemExit("JMAP update failed: missing updated/notUpdated\n")
+
+
+def jmap_sieve_script_get_by_name(
+    *,
+    api_url: str,
+    username: str,
+    password: str,
+    account_id: str,
+    script_name: str,
+    verify_tls: bool,
+) -> Optional[dict]:
+    query_req = {
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:sieve"],
+        "methodCalls": [
+            [
+                "SieveScript/query",
+                {"accountId": account_id, "filter": {"name": script_name}, "limit": 2},
+                "q1",
+            ]
+        ],
+    }
+    resp = jmap_call(
+        api_url=api_url,
+        username=username,
+        password=password,
+        request=query_req,
+        verify_tls=verify_tls,
+    )
+    payload = jmap_get_call_result(resp, call_id="q1", expected="SieveScript/query")
+    ids = payload.get("ids")
+    if not isinstance(ids, list):
+        return None
+    ids = [x for x in ids if isinstance(x, str)]
+    if not ids:
+        return None
+    if len(ids) > 1:
+        eprint(f"WARNING: multiple SieveScript items named {script_name!r}; using the first.")
+
+    get_req = {
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:sieve"],
+        "methodCalls": [
+            [
+                "SieveScript/get",
+                {"accountId": account_id, "ids": [ids[0]], "properties": ["id", "name", "blobId", "isActive"]},
+                "g1",
+            ]
+        ],
+    }
+    resp = jmap_call(
+        api_url=api_url,
+        username=username,
+        password=password,
+        request=get_req,
+        verify_tls=verify_tls,
+    )
+    payload = jmap_get_call_result(resp, call_id="g1", expected="SieveScript/get")
+    items = payload.get("list")
+    if not isinstance(items, list) or not items:
+        return None
+    item = items[0]
+    return item if isinstance(item, dict) else None
+
+
+def jmap_blob_get_bytes(
+    *,
+    api_url: str,
+    username: str,
+    password: str,
+    account_id: str,
+    blob_id: str,
+    verify_tls: bool,
+) -> bytes:
+    req = {
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:blob"],
+        "methodCalls": [["Blob/get", {"accountId": account_id, "ids": [blob_id]}, "b1"]],
+    }
+    resp = jmap_call(
+        api_url=api_url,
+        username=username,
+        password=password,
+        request=req,
+        verify_tls=verify_tls,
+    )
+    payload = jmap_get_call_result(resp, call_id="b1", expected="Blob/get")
+    items = payload.get("list")
+    if not isinstance(items, list) or not items:
+        raise SystemExit("Blob/get returned empty list\n")
+    item = items[0]
+    if not isinstance(item, dict):
+        raise SystemExit("Blob/get returned invalid item\n")
+
+    if isinstance(item.get("data:asText"), str):
+        return item["data:asText"].encode("utf-8")
+
+    if isinstance(item.get("data:asBase64"), str):
+        try:
+            return base64.b64decode(item["data:asBase64"])
+        except Exception as e:  # noqa: BLE001
+            raise SystemExit(f"Failed to decode Blob/get data:asBase64: {e}\n") from e
+
+    if isinstance(item.get("data"), str):
+        try:
+            return base64.b64decode(item["data"])
+        except Exception as e:  # noqa: BLE001
+            raise SystemExit(f"Failed to decode Blob/get data: {e}\n") from e
+
+    keys = ", ".join(sorted(item.keys()))
+    raise SystemExit(f"Blob/get missing data (expected data:asText/data:asBase64/data). Keys: {keys}\n")
+
+
+def jmap_blob_upload_text(
+    *,
+    api_url: str,
+    username: str,
+    password: str,
+    account_id: str,
+    content_type: str,
+    text: str,
+    verify_tls: bool,
+) -> str:
+    req = {
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:blob"],
+        "methodCalls": [
+            [
+                "Blob/upload",
+                {
+                    "accountId": account_id,
+                    "create": {"k0": {"type": content_type, "data": [{"data:asText": text}]}},
+                },
+                "u1",
+            ]
+        ],
+    }
+    resp = jmap_call(
+        api_url=api_url,
+        username=username,
+        password=password,
+        request=req,
+        verify_tls=verify_tls,
+    )
+    payload = jmap_get_call_result(resp, call_id="u1", expected="Blob/upload")
+    return jmap_set_expect_created_id(payload)
+
+
+def jmap_blob_upload_bytes(
+    *,
+    api_url: str,
+    username: str,
+    password: str,
+    account_id: str,
+    content_type: str,
+    data: bytes,
+    verify_tls: bool,
+) -> str:
+    req = {
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:blob"],
+        "methodCalls": [
+            [
+                "Blob/upload",
+                {
+                    "accountId": account_id,
+                    "create": {
+                        "k0": {
+                            "type": content_type,
+                            "data": [{"data:asBase64": base64.b64encode(data).decode("ascii")}],
+                        }
+                    },
+                },
+                "u1",
+            ]
+        ],
+    }
+    resp = jmap_call(
+        api_url=api_url,
+        username=username,
+        password=password,
+        request=req,
+        verify_tls=verify_tls,
+    )
+    payload = jmap_get_call_result(resp, call_id="u1", expected="Blob/upload")
+    return jmap_set_expect_created_id(payload)
+
+
+def jmap_sieve_script_validate(
+    *,
+    api_url: str,
+    username: str,
+    password: str,
+    account_id: str,
+    blob_id: str,
+    verify_tls: bool,
+) -> None:
+    req = {
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:sieve", "urn:ietf:params:jmap:blob"],
+        "methodCalls": [["SieveScript/validate", {"accountId": account_id, "blobId": blob_id}, "v1"]],
+    }
+    resp = jmap_call(
+        api_url=api_url,
+        username=username,
+        password=password,
+        request=req,
+        verify_tls=verify_tls,
+    )
+    payload = jmap_get_call_result(resp, call_id="v1", expected="SieveScript/validate")
+    err = payload.get("error")
+    if isinstance(err, dict) and err:
+        raise SystemExit(f"SieveScript/validate failed: {jmap_describe_set_error(err)}\n")
+
+
+def jmap_sieve_script_upsert(
+    *,
+    api_url: str,
+    username: str,
+    password: str,
+    account_id: str,
+    script_name: str,
+    blob_id: str,
+    existing_id: Optional[str],
+    verify_tls: bool,
+) -> None:
+    if existing_id:
+        req = {
+            "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:sieve", "urn:ietf:params:jmap:blob"],
+            "methodCalls": [
+                [
+                    "SieveScript/set",
+                    {"accountId": account_id, "update": {existing_id: {"blobId": blob_id}}},
+                    "s1",
+                ]
+            ],
+        }
+        resp = jmap_call(
+            api_url=api_url,
+            username=username,
+            password=password,
+            request=req,
+            verify_tls=verify_tls,
+        )
+        payload = jmap_get_call_result(resp, call_id="s1", expected="SieveScript/set")
+        jmap_set_expect_updated(payload, id_=existing_id)
+        return
+
+    req = {
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:sieve", "urn:ietf:params:jmap:blob"],
+        "methodCalls": [
+            [
+                "SieveScript/set",
+                {"accountId": account_id, "create": {"k0": {"name": script_name, "blobId": blob_id}}},
+                "s1",
+            ]
+        ],
+    }
+    resp = jmap_call(
+        api_url=api_url,
+        username=username,
+        password=password,
+        request=req,
+        verify_tls=verify_tls,
+    )
+    payload = jmap_get_call_result(resp, call_id="s1", expected="SieveScript/set")
+    _ = jmap_set_expect_created_id(payload)
+
+
+def jmap_address_book_get_all(
+    *,
+    api_url: str,
+    username: str,
+    password: str,
+    account_id: str,
+    verify_tls: bool,
+) -> list[dict]:
+    req = {
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:contacts"],
+        "methodCalls": [["AddressBook/get", {"accountId": account_id}, "a1"]],
+    }
+    resp = jmap_call(
+        api_url=api_url,
+        username=username,
+        password=password,
+        request=req,
+        verify_tls=verify_tls,
+    )
+    payload = jmap_get_call_result(resp, call_id="a1", expected="AddressBook/get")
+    items = payload.get("list")
+    if not isinstance(items, list):
+        raise SystemExit("AddressBook/get returned invalid list\n")
+    out: list[dict] = []
+    for item in items:
+        if isinstance(item, dict):
+            out.append(item)
+    return out
+
+
+def jmap_address_book_create(
+    *,
+    api_url: str,
+    username: str,
+    password: str,
+    account_id: str,
+    name: str,
+    verify_tls: bool,
+) -> str:
+    req = {
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:contacts"],
+        "methodCalls": [
+            [
+                "AddressBook/set",
+                {"accountId": account_id, "create": {"k0": {"name": name}}},
+                "s1",
+            ]
+        ],
+    }
+    resp = jmap_call(
+        api_url=api_url,
+        username=username,
+        password=password,
+        request=req,
+        verify_tls=verify_tls,
+    )
+    payload = jmap_get_call_result(resp, call_id="s1", expected="AddressBook/set")
+    return jmap_set_expect_created_id(payload)
+
+
+def jmap_contact_card_query_page(
+    *,
+    api_url: str,
+    username: str,
+    password: str,
+    account_id: str,
+    position: int,
+    limit: int,
+    calculate_total: bool,
+    verify_tls: bool,
+) -> dict:
+    req = {
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:contacts"],
+        "methodCalls": [
+            [
+                "ContactCard/query",
+                {
+                    "accountId": account_id,
+                    "position": position,
+                    "limit": limit,
+                    "calculateTotal": calculate_total,
+                },
+                "q1",
+            ]
+        ],
+    }
+    resp = jmap_call(
+        api_url=api_url,
+        username=username,
+        password=password,
+        request=req,
+        verify_tls=verify_tls,
+    )
+    return jmap_get_call_result(resp, call_id="q1", expected="ContactCard/query")
+
+
+def jmap_contact_card_query_all_ids(
+    *,
+    api_url: str,
+    username: str,
+    password: str,
+    account_id: str,
+    page_size: int,
+    verify_tls: bool,
+) -> list[str]:
+    position = 0
+    first = jmap_contact_card_query_page(
+        api_url=api_url,
+        username=username,
+        password=password,
+        account_id=account_id,
+        position=position,
+        limit=page_size,
+        calculate_total=True,
+        verify_tls=verify_tls,
+    )
+    ids = first.get("ids")
+    if not isinstance(ids, list):
+        raise SystemExit("ContactCard/query returned invalid ids\n")
+    out: list[str] = [id_ for id_ in ids if isinstance(id_, str)]
+    total = first.get("total")
+    if not isinstance(total, int):
+        total = None
+    position += len(out)
+
+    while total is None or position < total:
+        page = jmap_contact_card_query_page(
+            api_url=api_url,
+            username=username,
+            password=password,
+            account_id=account_id,
+            position=position,
+            limit=page_size,
+            calculate_total=False,
+            verify_tls=verify_tls,
+        )
+        ids = page.get("ids")
+        if not isinstance(ids, list) or not ids:
+            break
+        page_ids = [id_ for id_ in ids if isinstance(id_, str)]
+        out.extend(page_ids)
+        position += len(page_ids)
+        if len(page_ids) < page_size:
+            break
+
+    return out
+
+
+def jmap_contact_card_get(
+    *,
+    api_url: str,
+    username: str,
+    password: str,
+    account_id: str,
+    ids: list[str],
+    properties: list[str],
+    verify_tls: bool,
+) -> list[dict]:
+    if not ids:
+        return []
+    req = {
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:contacts"],
+        "methodCalls": [
+            [
+                "ContactCard/get",
+                {"accountId": account_id, "ids": ids, "properties": properties},
+                "g1",
+            ]
+        ],
+    }
+    resp = jmap_call(
+        api_url=api_url,
+        username=username,
+        password=password,
+        request=req,
+        verify_tls=verify_tls,
+    )
+    payload = jmap_get_call_result(resp, call_id="g1", expected="ContactCard/get")
+    items = payload.get("list")
+    if not isinstance(items, list):
+        raise SystemExit("ContactCard/get returned invalid list\n")
+    out: list[dict] = []
+    for item in items:
+        if isinstance(item, dict):
+            out.append(item)
+    return out
+
+
+def jmap_contact_card_set(
+    *,
+    api_url: str,
+    username: str,
+    password: str,
+    account_id: str,
+    create: dict[str, dict],
+    update: dict[str, dict],
+    verify_tls: bool,
+) -> dict:
+    args: dict[str, object] = {"accountId": account_id}
+    if create:
+        args["create"] = create
+    if update:
+        args["update"] = update
+    req = {
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:contacts"],
+        "methodCalls": [["ContactCard/set", args, "s1"]],
+    }
+    resp = jmap_call(
+        api_url=api_url,
+        username=username,
+        password=password,
+        request=req,
+        verify_tls=verify_tls,
+    )
+    return jmap_get_call_result(resp, call_id="s1", expected="ContactCard/set")
+
+
+def jmap_calendar_get_all(
+    *,
+    api_url: str,
+    username: str,
+    password: str,
+    account_id: str,
+    verify_tls: bool,
+) -> list[dict]:
+    req = {
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:calendars"],
+        "methodCalls": [["Calendar/get", {"accountId": account_id}, "c1"]],
+    }
+    resp = jmap_call(
+        api_url=api_url,
+        username=username,
+        password=password,
+        request=req,
+        verify_tls=verify_tls,
+    )
+    payload = jmap_get_call_result(resp, call_id="c1", expected="Calendar/get")
+    items = payload.get("list")
+    if not isinstance(items, list):
+        raise SystemExit("Calendar/get returned invalid list\n")
+    out: list[dict] = []
+    for item in items:
+        if isinstance(item, dict):
+            out.append(item)
+    return out
+
+
+def jmap_calendar_create(
+    *,
+    api_url: str,
+    username: str,
+    password: str,
+    account_id: str,
+    name: str,
+    verify_tls: bool,
+) -> str:
+    req = {
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:calendars"],
+        "methodCalls": [["Calendar/set", {"accountId": account_id, "create": {"k0": {"name": name}}}, "s1"]],
+    }
+    resp = jmap_call(
+        api_url=api_url,
+        username=username,
+        password=password,
+        request=req,
+        verify_tls=verify_tls,
+    )
+    payload = jmap_get_call_result(resp, call_id="s1", expected="Calendar/set")
+    return jmap_set_expect_created_id(payload)
+
+
+def jmap_calendar_event_parse(
+    *,
+    api_url: str,
+    username: str,
+    password: str,
+    account_id: str,
+    blob_id: str,
+    verify_tls: bool,
+) -> list[dict]:
+    req = {
+        "using": [
+            "urn:ietf:params:jmap:core",
+            "urn:ietf:params:jmap:calendars",
+            "urn:ietf:params:jmap:calendars:parse",
+        ],
+        "methodCalls": [["CalendarEvent/parse", {"accountId": account_id, "blobIds": [blob_id]}, "p1"]],
+    }
+    resp = jmap_call(
+        api_url=api_url,
+        username=username,
+        password=password,
+        request=req,
+        verify_tls=verify_tls,
+    )
+    payload = jmap_get_call_result(resp, call_id="p1", expected="CalendarEvent/parse")
+
+    not_found = payload.get("notFound")
+    if isinstance(not_found, list) and any(isinstance(x, str) and x == blob_id for x in not_found):
+        raise SystemExit("uploaded ics blob not found upstream\n")
+    not_parsable = payload.get("notParsable")
+    if isinstance(not_parsable, list) and any(isinstance(x, str) and x == blob_id for x in not_parsable):
+        raise SystemExit("uploaded ics could not be parsed\n")
+
+    parsed = payload.get("parsed")
+    if not isinstance(parsed, dict) or not parsed:
+        raise SystemExit("CalendarEvent/parse missing parsed\n")
+
+    events_obj = parsed.get(blob_id)
+    if events_obj is None and len(parsed) == 1:
+        events_obj = next(iter(parsed.values()))
+    if not isinstance(events_obj, list):
+        raise SystemExit("CalendarEvent/parse parsed value is not an array\n")
+
+    out: list[dict] = []
+    for ev in events_obj:
+        if isinstance(ev, dict):
+            out.append(ev)
+    return out
+
+
+def jmap_calendar_event_query_page(
+    *,
+    api_url: str,
+    username: str,
+    password: str,
+    account_id: str,
+    filter_obj: dict,
+    position: int,
+    limit: int,
+    calculate_total: bool,
+    verify_tls: bool,
+) -> dict:
+    req = {
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:calendars"],
+        "methodCalls": [
+            [
+                "CalendarEvent/query",
+                {
+                    "accountId": account_id,
+                    "filter": filter_obj,
+                    "position": position,
+                    "limit": limit,
+                    "calculateTotal": calculate_total,
+                },
+                "q1",
+            ]
+        ],
+    }
+    resp = jmap_call(
+        api_url=api_url,
+        username=username,
+        password=password,
+        request=req,
+        verify_tls=verify_tls,
+    )
+    return jmap_get_call_result(resp, call_id="q1", expected="CalendarEvent/query")
+
+
+def jmap_calendar_event_query_all_ids(
+    *,
+    api_url: str,
+    username: str,
+    password: str,
+    account_id: str,
+    filter_obj: dict,
+    page_size: int,
+    verify_tls: bool,
+) -> list[str]:
+    position = 0
+    first = jmap_calendar_event_query_page(
+        api_url=api_url,
+        username=username,
+        password=password,
+        account_id=account_id,
+        filter_obj=filter_obj,
+        position=position,
+        limit=page_size,
+        calculate_total=True,
+        verify_tls=verify_tls,
+    )
+    ids = first.get("ids")
+    if not isinstance(ids, list):
+        raise SystemExit("CalendarEvent/query returned invalid ids\n")
+    out: list[str] = [id_ for id_ in ids if isinstance(id_, str)]
+    total = first.get("total")
+    if not isinstance(total, int):
+        total = None
+    position += len(out)
+
+    while total is None or position < total:
+        page = jmap_calendar_event_query_page(
+            api_url=api_url,
+            username=username,
+            password=password,
+            account_id=account_id,
+            filter_obj=filter_obj,
+            position=position,
+            limit=page_size,
+            calculate_total=False,
+            verify_tls=verify_tls,
+        )
+        ids = page.get("ids")
+        if not isinstance(ids, list) or not ids:
+            break
+        page_ids = [id_ for id_ in ids if isinstance(id_, str)]
+        out.extend(page_ids)
+        position += len(page_ids)
+        if len(page_ids) < page_size:
+            break
+
+    return out
+
+
+def jmap_calendar_event_get(
+    *,
+    api_url: str,
+    username: str,
+    password: str,
+    account_id: str,
+    ids: list[str],
+    properties: list[str],
+    verify_tls: bool,
+) -> list[dict]:
+    if not ids:
+        return []
+    req = {
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:calendars"],
+        "methodCalls": [["CalendarEvent/get", {"accountId": account_id, "ids": ids, "properties": properties}, "g1"]],
+    }
+    resp = jmap_call(
+        api_url=api_url,
+        username=username,
+        password=password,
+        request=req,
+        verify_tls=verify_tls,
+    )
+    payload = jmap_get_call_result(resp, call_id="g1", expected="CalendarEvent/get")
+    items = payload.get("list")
+    if not isinstance(items, list):
+        raise SystemExit("CalendarEvent/get returned invalid list\n")
+    out: list[dict] = []
+    for item in items:
+        if isinstance(item, dict):
+            out.append(item)
+    return out
+
+
+def jmap_calendar_event_set(
+    *,
+    api_url: str,
+    username: str,
+    password: str,
+    account_id: str,
+    create: dict[str, dict],
+    update: dict[str, dict],
+    send_scheduling_messages: bool,
+    verify_tls: bool,
+) -> dict:
+    args: dict[str, object] = {
+        "accountId": account_id,
+        "sendSchedulingMessages": bool(send_scheduling_messages),
+    }
+    if create:
+        args["create"] = create
+    if update:
+        args["update"] = update
+    req = {
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:calendars"],
+        "methodCalls": [["CalendarEvent/set", args, "s1"]],
+    }
+    resp = jmap_call(
+        api_url=api_url,
+        username=username,
+        password=password,
+        request=req,
+        verify_tls=verify_tls,
+    )
+    return jmap_get_call_result(resp, call_id="s1", expected="CalendarEvent/set")
+
+
+def truthy(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+def filter_rule_is_active(rule: object) -> bool:
+    if not isinstance(rule, dict):
+        return True
+    if "active" not in rule:
+        return True
+    return truthy(rule.get("active"))
+
+
+def normalize_rule_name(name: str) -> str:
+    return name.strip().lower()
+
+
+def merge_imported_filter_rules(
+    *,
+    existing_rules: list[object],
+    imported_rules: list[dict],
+    preserve_active: bool,
+    force: bool,
+) -> tuple[list[object], list[str]]:
+    out_rules: list[object] = copy.deepcopy(existing_rules)
+    actions: list[str] = []
+
+    def indices_for(name: str) -> list[int]:
+        key = normalize_rule_name(name)
+        idxs: list[int] = []
+        for i, r in enumerate(out_rules):
+            if not isinstance(r, dict):
+                continue
+            rname = r.get("name")
+            if isinstance(rname, str) and normalize_rule_name(rname) == key:
+                idxs.append(i)
+        return idxs
+
+    for src_rule in imported_rules:
+        raw_name = src_rule.get("name")
+        if not isinstance(raw_name, str):
+            continue
+        base_name = raw_name.strip()
+        if not base_name:
+            continue
+
+        new_rule = copy.deepcopy(src_rule)
+        new_rule["name"] = base_name
+        if not preserve_active:
+            new_rule["active"] = False
+        else:
+            new_rule["active"] = truthy(src_rule.get("active", True))
+
+        base_idxs = indices_for(base_name)
+        base_blocked = (not force) and any(
+            filter_rule_is_active(out_rules[i]) for i in base_idxs if i < len(out_rules)
+        )
+
+        if not base_blocked:
+            if base_idxs:
+                idx = base_idxs[0]
+                if out_rules[idx] != new_rule:
+                    out_rules[idx] = new_rule
+                    actions.append(f"update: {base_name}")
+            else:
+                out_rules.append(new_rule)
+                actions.append(f"create: {base_name}")
+            continue
+
+        # Base name exists and at least one instance is active. Import as Name(1) unless blocked.
+        variant_name = f"{base_name}(1)"
+        variant_rule = copy.deepcopy(new_rule)
+        variant_rule["name"] = variant_name
+
+        variant_idxs = indices_for(variant_name)
+        variant_blocked = any(
+            filter_rule_is_active(out_rules[i]) for i in variant_idxs if i < len(out_rules)
+        )
+        if variant_blocked:
+            raise SystemExit(
+                f"Refusing to import {base_name!r}: both {base_name!r} and {variant_name!r} are active.\n"
+                "Disable one of them or re-run with --force.\n"
+            )
+
+        if variant_idxs:
+            idx = variant_idxs[0]
+            if out_rules[idx] != variant_rule:
+                out_rules[idx] = variant_rule
+                actions.append(f"update: {variant_name}")
+        else:
+            out_rules.append(variant_rule)
+            actions.append(f"create: {variant_name}")
+
+    return out_rules, actions
+
+
+def cmd_bridge_import_tags(args: argparse.Namespace) -> int:
+    tagmap_path = Path(args.tagmap_json)
+    if not tagmap_path.exists():
+        raise SystemExit(f"Missing tagmap JSON: {tagmap_path}\n")
+
+    bridge_data_dir = Path(args.bridge_data_dir)
+    host = args.bridge_host.strip()
+    username = args.bridge_username.strip()
+    account_id = (args.bridge_account_id or "").strip()
+    if not host or not username:
+        raise SystemExit("--bridge-host/--bridge-username are required\n")
+
+    tags_dir = bridge_data_dir / "tags"
+    tags_dir.mkdir(parents=True, exist_ok=True)
+
+    tags_path: Path
+    if account_id:
+        key = safe_storage_key(f"{host}__{username}__{account_id}")
+        tags_path = tags_dir / f"{key}.json"
+    else:
+        # Try to infer the correct store file by looking for an existing tag store for this user.
+        prefix = safe_storage_key(f"{host}__{username}__")
+        matches = sorted(tags_dir.glob(f"{prefix}*.json"))
+        if len(matches) == 1:
+            tags_path = matches[0]
+        elif len(matches) > 1:
+            options = "\n".join(f"- {p.name}" for p in matches)
+            raise SystemExit(
+                "Multiple bridge tag stores match this user; please specify --bridge-account-id.\n"
+                f"Matches:\n{options}\n"
+            )
+        else:
+            # No prior bridge state found. Default to the common Stalwart mail account id.
+            account_id = "c"
+            key = safe_storage_key(f"{host}__{username}__{account_id}")
+            tags_path = tags_dir / f"{key}.json"
+            eprint(
+                f"NOTE: no existing bridge tag store found for {username!r}; "
+                f"defaulting --bridge-account-id to {account_id!r}. "
+                "Override with --bridge-account-id if needed."
+            )
+
+    try:
+        tagmap = json.loads(read_text_file(tagmap_path))
+    except Exception as e:  # noqa: BLE001
+        raise SystemExit(f"Failed to parse tagmap JSON: {e}\n") from e
+
+    if not isinstance(tagmap, list):
+        raise SystemExit("tagmap JSON must be a list\n")
+
+    if tags_path.exists():
+        try:
+            stored = json.loads(read_text_file(tags_path))
+        except Exception as e:  # noqa: BLE001
+            raise SystemExit(f"Failed to parse existing bridge tags file {tags_path}: {e}\n") from e
+    else:
+        stored = {"version": 1, "updatedAt": "1970-01-01T00:00:00Z", "tags": []}
+
+    tags_list = stored.get("tags")
+    if not isinstance(tags_list, list):
+        tags_list = []
+        stored["tags"] = tags_list
+
+    existing_by_name: dict[str, dict] = {}
+    used_ids: set[str] = set()
+    max_id = 63
+    for t in tags_list:
+        if not isinstance(t, dict):
+            continue
+        name = str(t.get("name") or "").strip()
+        if name:
+            existing_by_name[name.lower()] = t
+        tid = str(t.get("id") or "").strip()
+        if tid:
+            used_ids.add(tid)
+            try:
+                max_id = max(max_id, int(tid))
+            except ValueError:
+                pass
+
+    overwrite = bool(args.overwrite)
+    planned: list[str] = []
+
+    for row in tagmap:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("status") or "").strip() != "ok":
+            continue
+
+        name = str(row.get("soapName") or "").strip()
+        keyword = str(row.get("imapKeyword") or "").strip()
+        color_raw = str(row.get("soapColor") or "").strip()
+        if not name or not keyword:
+            continue
+
+        try:
+            color = int(color_raw) if color_raw else 0
+        except ValueError:
+            color = 0
+
+        existing = existing_by_name.get(name.lower())
+        if existing is not None:
+            changed = False
+            if overwrite or not str(existing.get("keyword") or "").strip():
+                existing["keyword"] = keyword
+                changed = True
+            if overwrite or (int(existing.get("color") or 0) == 0 and color != 0):
+                existing["color"] = color
+                changed = True
+            if changed:
+                planned.append(f"update tag: {name!r} -> keyword={keyword!r} color={color}")
+            continue
+
+        soap_id = str(row.get("soapTagId") or "").strip()
+        tag_id: str
+        if soap_id.isdigit() and soap_id not in used_ids:
+            tag_id = soap_id
+        else:
+            max_id += 1
+            tag_id = str(max_id)
+            while tag_id in used_ids:
+                max_id += 1
+                tag_id = str(max_id)
+
+        used_ids.add(tag_id)
+        tags_list.append(
+            {
+                "id": tag_id,
+                "name": name,
+                "keyword": keyword,
+                "color": color,
+            }
+        )
+        existing_by_name[name.lower()] = tags_list[-1]
+        planned.append(f"create tag: {name!r} id={tag_id} keyword={keyword!r} color={color}")
+
+    stored["version"] = 1
+    if planned:
+        stored["updatedAt"] = now_rfc3339_utc()
+
+    if args.dry_run:
+        print(f"Would update {tags_path}:")
+        if planned:
+            for line in planned:
+                print(f"- {line}")
+        else:
+            print("- (no changes)")
+        return 0
+
+    if not planned:
+        print(f"No changes for {tags_path}")
+        return 0
+
+    tags_path.write_text(json.dumps(stored, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(f"Wrote {tags_path}")
+    for line in planned:
+        print(f"- {line}")
+    return 0
+
+
+def imap_get_flags_keywords(
+    *,
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    mailbox: str,
+    verify_tls: bool,
+) -> list[str]:
+    ctx = build_ssl_context(verify=verify_tls)
+    try:
+        imap = imaplib.IMAP4_SSL(host, port, ssl_context=ctx)
+    except Exception as e:  # noqa: BLE001
+        raise SystemExit(f"Failed to connect to IMAP {host}:{port}: {e}\n") from e
+
+    try:
+        imap.login(username, password)
+        typ, _ = imap.select(mailbox, readonly=True)
+        if typ != "OK":
+            raise SystemExit(f"IMAP SELECT failed for {mailbox}\n")
+
+        # imaplib stores mailbox FLAGS as an untagged response after SELECT.
+        # Python versions differ (3.10 uses `untagged_responses` + `response()`).
+        _code, data = imap.response("FLAGS")
+        raw_flags = data[0] if data and data[0] is not None else b""
+        text = raw_flags.decode("utf-8", errors="replace").strip()
+        # Format is like: (\Answered \Deleted ... MyTag:FLAG256 BlueTag:FLAG257)
+        text = text.strip()
+        if text.startswith("(") and text.endswith(")"):
+            text = text[1:-1]
+        tokens = [t for t in text.split() if t]
+        keywords: list[str] = []
+        for tok in tokens:
+            if tok.startswith("\\"):
+                continue
+            if tok.startswith("$"):
+                continue
+            # Zimbra's own junk-related tokens appear as plain atoms too; keep only FLAG-style tags for mapping.
+            if IMAP_FLAG_TOKEN_RE.match(tok):
+                keywords.append(tok)
+        return sorted(set(keywords))
+    finally:
+        try:
+            imap.logout()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@dataclass(frozen=True)
+class TagMapRow:
+    soap_tag_id: str
+    soap_name: str
+    soap_color: Optional[str]
+    imap_keyword: Optional[str]
+    status: str  # ok | missing-imap | ambiguous
+
+
+def build_tag_mapping(soap_tags: Iterable[ZimbraTag], imap_keywords: Iterable[str]) -> list[TagMapRow]:
+    by_stem: dict[str, list[str]] = {}
+    for kw in imap_keywords:
+        m = IMAP_FLAG_TOKEN_RE.match(kw)
+        if not m:
+            continue
+        stem = m.group("stem").lower()
+        by_stem.setdefault(stem, []).append(kw)
+
+    rows: list[TagMapRow] = []
+    for tag in soap_tags:
+        stem = canonical_tag_stem(tag.name).lower()
+        matches = by_stem.get(stem, [])
+        if len(matches) == 1:
+            rows.append(
+                TagMapRow(
+                    soap_tag_id=tag.soap_id,
+                    soap_name=tag.name,
+                    soap_color=tag.color,
+                    imap_keyword=matches[0],
+                    status="ok",
+                )
+            )
+        elif len(matches) == 0:
+            rows.append(
+                TagMapRow(
+                    soap_tag_id=tag.soap_id,
+                    soap_name=tag.name,
+                    soap_color=tag.color,
+                    imap_keyword=None,
+                    status="missing-imap",
+                )
+            )
+        else:
+            rows.append(
+                TagMapRow(
+                    soap_tag_id=tag.soap_id,
+                    soap_name=tag.name,
+                    soap_color=tag.color,
+                    imap_keyword=None,
+                    status="ambiguous",
+                )
+            )
+    return rows
+
+
+def write_tagmap_csv(path: Path, rows: list[TagMapRow]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["soap_tag_id", "soap_name", "soap_color", "imap_keyword", "status"])
+        for r in rows:
+            w.writerow([r.soap_tag_id, r.soap_name, r.soap_color or "", r.imap_keyword or "", r.status])
+
+
+def write_tagmap_json(path: Path, rows: list[TagMapRow]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = [
+        {
+            "soapTagId": r.soap_tag_id,
+            "soapName": r.soap_name,
+            "soapColor": r.soap_color,
+            "imapKeyword": r.imap_keyword,
+            "status": r.status,
+        }
+        for r in rows
+    ]
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def xml_escape(value: str) -> str:
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    pkg_mgr = detect_pkg_manager()
+    osr = parse_os_release()
+    os_id = osr.get("ID", "")
+    os_like = osr.get("ID_LIKE", "")
+
+    want = ["imapsync"]
+    missing = [c for c in want if not which(c)]
+    if not missing:
+        print("All required commands are installed.")
+        return 0
+
+    if not pkg_mgr:
+        eprint("Missing commands:", ", ".join(missing))
+        eprint("No supported package manager found (apt-get/dnf/yum).")
+        return 2
+
+    print(f"Detected OS: ID={os_id!r} ID_LIKE={os_like!r}")
+    print(f"Detected package manager: {pkg_mgr}")
+
+    if pkg_mgr == "apt-get":
+        run(["sudo", "apt-get", "update"], dry_run=args.dry_run)
+        run(
+            ["sudo", "apt-get", "install", "-y", "imapsync"],
+            dry_run=args.dry_run,
+            check=False,
+        )
+        if args.dry_run:
+            return 0
+        if which("imapsync"):
+            print("imapsync installed.")
+            return 0
+
+        # On Ubuntu, imapsync is typically in the "universe" component. If it's not enabled,
+        # apt won't find the package.
+        if os_id.lower() == "ubuntu" and not apt_has_universe_enabled():
+            eprint("\n`imapsync` not found in current APT sources.")
+            eprint("Attempting to enable Ubuntu 'universe' and retry...\n")
+
+            if not which("add-apt-repository"):
+                run(
+                    ["sudo", "apt-get", "install", "-y", "software-properties-common"],
+                    dry_run=args.dry_run,
+                    check=False,
+                )
+            if which("add-apt-repository"):
+                run(["sudo", "add-apt-repository", "-y", "universe"], dry_run=args.dry_run, check=False)
+                run(["sudo", "apt-get", "update"], dry_run=args.dry_run)
+                run(
+                    ["sudo", "apt-get", "install", "-y", "imapsync"],
+                    dry_run=args.dry_run,
+                    check=False,
+                )
+
+            if which("imapsync"):
+                print("imapsync installed.")
+                return 0
+
+        eprint("\nFailed to install imapsync via apt. Trying source install...")
+        if install_imapsync_from_source_apt(dry_run=args.dry_run):
+            print("imapsync installed (source).")
+            return 0
+
+        eprint("\nStill unable to install imapsync.")
+        eprint("Options:")
+        eprint(
+            "  - Install imapsync from upstream: https://imapsync.lamiral.info/\n"
+            "  - Or run imapsync in a container (example):\n"
+            "      docker run --rm -it gilleslamiral/imapsync imapsync --help"
+        )
+        return 2
+    elif pkg_mgr in ("dnf", "yum"):
+        # imapsync may be in EPEL for RHEL/CentOS/Rocky/Alma. We try a straightforward install and
+        # rely on the error output if EPEL is missing.
+        run(["sudo", pkg_mgr, "install", "-y", "imapsync"], dry_run=args.dry_run, check=False)
+        if not which("imapsync"):
+            eprint(
+                "\nNOTE: imapsync may require EPEL on RHEL-like distros.\n"
+                "If install failed, try:\n"
+                "  sudo dnf install -y epel-release\n"
+                "  sudo dnf install -y imapsync\n"
+            )
+            return 2
+    else:
+        eprint(f"Unsupported package manager: {pkg_mgr}")
+        return 2
+
+    if which("imapsync"):
+        print("imapsync installed.")
+        return 0
+    eprint("imapsync still not found after init.")
+    return 2
+
+
+def cmd_export_zimbra_tag_map(args: argparse.Namespace) -> int:
+    soap_url = args.soap_url or f"https://{args.zimbra_host}/service/soap"
+
+    password = load_secret(
+        label="Zimbra password",
+        value=args.zimbra_password,
+        env=args.zimbra_password_env,
+        file=args.zimbra_password_file,
+        prompt=args.prompt_password,
+    )
+
+    auth_token = zimbra_soap_auth_token(
+        soap_url,
+        username=args.zimbra_user,
+        password=password,
+        verify_tls=not args.insecure,
+    )
+
+    tags = zimbra_soap_get_tags(soap_url, auth_token=auth_token, verify_tls=not args.insecure)
+    if not tags:
+        eprint("No tags found via SOAP.")
+
+    imap_host = args.imap_host or args.zimbra_host
+    imap_port = args.imap_port
+    imap_user = args.imap_user or args.zimbra_user
+    imap_password = password if args.imap_password is None else load_secret(
+        label="IMAP password",
+        value=args.imap_password,
+        env=args.imap_password_env,
+        file=args.imap_password_file,
+        prompt=args.prompt_password,
+    )
+
+    keywords = imap_get_flags_keywords(
+        host=imap_host,
+        port=imap_port,
+        username=imap_user,
+        password=imap_password,
+        mailbox=args.imap_mailbox,
+        verify_tls=not args.insecure,
+    )
+
+    rows = build_tag_mapping(tags, keywords)
+    out_csv = Path(args.out_csv)
+    out_json = Path(args.out_json) if args.out_json else out_csv.with_suffix(".json")
+
+    ok = sum(1 for r in rows if r.status == "ok")
+    missing = sum(1 for r in rows if r.status != "ok")
+
+    if args.dry_run:
+        print(f"Would write {out_csv} and {out_json} ({ok} mapped, {missing} unmapped)")
+        w = csv.writer(sys.stdout)
+        w.writerow(["soap_tag_id", "soap_name", "soap_color", "imap_keyword", "status"])
+        for r in rows:
+            w.writerow([r.soap_tag_id, r.soap_name, r.soap_color or "", r.imap_keyword or "", r.status])
+        return 0
+
+    write_tagmap_csv(out_csv, rows)
+    write_tagmap_json(out_json, rows)
+
+    print(f"Wrote {out_csv} and {out_json} ({ok} mapped, {missing} unmapped)")
+    if missing:
+        print(
+            "Unmapped tags typically mean: tag exists in SOAP but has not been applied to any message yet."
+        )
+    return 0
+
+
+def write_secret_tempfile(secret: str, *, label: str) -> Path:
+    fd, path = tempfile.mkstemp(prefix=f"smmailbox-{label}-", text=True)
+    os.close(fd)
+    p = Path(path)
+    os.chmod(p, 0o600)
+    p.write_text(secret + "\n", encoding="utf-8")
+    return p
+
+
+def cmd_imapsync(args: argparse.Namespace) -> int:
+    require_command(
+        "imapsync",
+        "Install it (Debian/Ubuntu): sudo apt-get install -y imapsync\n"
+        "Or run: ./smmailbox --init\n",
+    )
+
+    if args.dry_run:
+        argv: list[str] = [
+            "imapsync",
+            "--host1",
+            args.src_host,
+            "--user1",
+            args.src_user,
+            "--passfile1",
+            "<redacted>",
+            "--host2",
+            args.dst_host,
+            "--user2",
+            args.dst_user,
+            "--passfile2",
+            "<redacted>",
+        ]
+        if args.src_port:
+            argv += ["--port1", str(args.src_port)]
+        if args.dst_port:
+            argv += ["--port2", str(args.dst_port)]
+        if args.src_ssl:
+            argv += ["--ssl1"]
+        if args.dst_ssl:
+            argv += ["--ssl2"]
+        argv += [
+            "--syncinternaldates",
+            "--syncflags",
+            "--nofoldersizes",
+            "--nofoldersizesatend",
+        ]
+        for extra in args.imapsync_arg or []:
+            argv.append(extra)
+        print(shell_join(argv))
+        return 0
+
+    src_pass = load_secret(
+        label="Source password",
+        value=args.src_password,
+        env=args.src_password_env,
+        file=args.src_password_file,
+        prompt=args.prompt_password,
+    )
+    dst_pass = load_secret(
+        label="Destination password",
+        value=args.dst_password,
+        env=args.dst_password_env,
+        file=args.dst_password_file,
+        prompt=args.prompt_password,
+    )
+
+    passfile1 = write_secret_tempfile(src_pass, label="src")
+    passfile2 = write_secret_tempfile(dst_pass, label="dst")
+
+    try:
+        argv: list[str] = [
+            "imapsync",
+            "--host1",
+            args.src_host,
+            "--user1",
+            args.src_user,
+            "--passfile1",
+            str(passfile1),
+            "--host2",
+            args.dst_host,
+            "--user2",
+            args.dst_user,
+            "--passfile2",
+            str(passfile2),
+        ]
+
+        if args.src_port:
+            argv += ["--port1", str(args.src_port)]
+        if args.dst_port:
+            argv += ["--port2", str(args.dst_port)]
+        if args.src_ssl:
+            argv += ["--ssl1"]
+        if args.dst_ssl:
+            argv += ["--ssl2"]
+
+        # Safe-ish defaults; users can override by passing extra args.
+        argv += [
+            "--syncinternaldates",
+            "--syncflags",
+            "--nofoldersizes",
+            "--nofoldersizesatend",
+        ]
+
+        for extra in args.imapsync_arg or []:
+            argv.append(extra)
+
+        return int(run_imapsync(argv, verbose=bool(args.verbose)).returncode)
+    finally:
+        for p in (passfile1, passfile2):
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def cmd_clone(args: argparse.Namespace) -> int:
+    """
+    Phase 1 end-to-end clone:
+      1) Export tag metadata + IMAP keyword mapping from Zimbra (SOAP + IMAP FLAGS).
+      2) Copy mail/folders/flags via imapsync (Zimbra IMAP -> Stalwart IMAP).
+      3) Import tag name/color/keyword mapping into Project Z-Bridge tag storage so ZWC can
+         display pretty tag names + colors for the migrated IMAP keywords.
+    """
+    out_csv = Path(args.out_csv)
+    out_json = Path(args.out_json) if args.out_json else out_csv.with_suffix(".json")
+
+    result_code = 0
+    summaries: list[tuple[str, str, str]] = []
+
+    def record(step_name: str, status: str, detail: str = "") -> None:
+        summaries.append((step_name, status, detail))
+
+    def finish(code: int) -> int:
+        nonlocal result_code
+        result_code = int(code)
+        return result_code
+
+    require_command(
+        "imapsync",
+        "Install it (Debian/Ubuntu): sudo apt-get install -y imapsync\n"
+        "Or run: ./smmailbox --init\n",
+    )
+
+    try:
+        soap_url = args.soap_url or f"https://{args.zimbra_host}/service/soap"
+        zimbra_password = load_secret(
+            label="Zimbra password",
+            value=args.zimbra_password,
+            env=args.zimbra_password_env,
+            file=args.zimbra_password_file,
+            prompt=args.prompt_password,
+        )
+
+        # 1) tag mapping
+        auth_token = zimbra_soap_auth_token(
+            soap_url,
+            username=args.zimbra_user,
+            password=zimbra_password,
+            verify_tls=not args.insecure,
+        )
+
+        tags = zimbra_soap_get_tags(soap_url, auth_token=auth_token, verify_tls=not args.insecure)
+        if not tags:
+            eprint("No tags found via SOAP.")
+
+        src_imap_host = args.imap_host or args.zimbra_host
+        src_imap_user = args.imap_user or args.zimbra_user
+        src_imap_password = zimbra_password if args.imap_password is None else load_secret(
+            label="IMAP password",
+            value=args.imap_password,
+            env=args.imap_password_env,
+            file=args.imap_password_file,
+            prompt=args.prompt_password,
+        )
+
+        keywords = imap_get_flags_keywords(
+            host=src_imap_host,
+            port=args.imap_port,
+            username=src_imap_user,
+            password=src_imap_password,
+            mailbox=args.imap_mailbox,
+            verify_tls=not args.insecure,
+        )
+
+        rows = build_tag_mapping(tags, keywords)
+        ok = sum(1 for r in rows if r.status == "ok")
+        missing = sum(1 for r in rows if r.status != "ok")
+
+        tagmap_data = [
+            {
+                "soapTagId": r.soap_tag_id,
+                "soapName": r.soap_name,
+                "soapColor": r.soap_color,
+                "imapKeyword": r.imap_keyword,
+                "status": r.status,
+            }
+            for r in rows
+        ]
+
+        with_filters = bool(getattr(args, "with_filters", False))
+        with_contacts = bool(getattr(args, "with_contacts", False))
+        with_calendars = bool(getattr(args, "with_calendars", False))
+        total_steps = 3 + int(with_filters) + int(with_contacts) + int(with_calendars)
+        step = 0
+
+        step += 1
+        step_name = "export-tag-map"
+        print(f"[{step}/{total_steps}] {step_name} ({ok} mapped, {missing} unmapped)")
+        if args.dry_run:
+            print(f"Would write {out_csv} and {out_json}")
+            record(step_name, "DRY-RUN", f"mapped={ok} missing={missing}")
+        else:
+            write_tagmap_csv(out_csv, rows)
+            write_tagmap_json(out_json, rows)
+            print(f"Wrote {out_csv} and {out_json}")
+            if missing:
+                print(
+                    "Unmapped tags typically mean: tag exists in SOAP but has not been applied to any message yet."
+                )
+            record(step_name, "OK", f"mapped={ok} missing={missing}")
+
+        # 2) imapsync copy (mail + folders + flags)
+        step += 1
+        step_name = "imapsync"
+        print(f"[{step}/{total_steps}] {step_name} (mail/folders/flags)")
+        dst_password: Optional[str] = None
+        if args.dry_run:
+            argv: list[str] = [
+                "imapsync",
+                "--host1",
+                src_imap_host,
+                "--user1",
+                src_imap_user,
+                "--passfile1",
+                "<redacted>",
+                "--host2",
+                args.dst_host,
+                "--user2",
+                args.dst_user,
+                "--passfile2",
+                "<redacted>",
+            ]
+            argv += ["--port1", str(args.imap_port)]
+            argv += ["--port2", str(args.dst_port)]
+            if args.src_ssl:
+                argv += ["--ssl1"]
+            if args.dst_ssl:
+                argv += ["--ssl2"]
+            argv += [
+                "--syncinternaldates",
+                "--syncflags",
+                "--nofoldersizes",
+                "--nofoldersizesatend",
+            ]
+            for extra in args.imapsync_arg or []:
+                argv.append(extra)
+            print(shell_join(argv))
+            record(step_name, "DRY-RUN")
+        else:
+            dst_password = load_secret(
+                label="Destination password",
+                value=args.dst_password,
+                env=args.dst_password_env,
+                file=args.dst_password_file,
+                prompt=args.prompt_password,
+            )
+
+            passfile1 = write_secret_tempfile(src_imap_password, label="src")
+            passfile2 = write_secret_tempfile(dst_password, label="dst")
+            try:
+                argv = [
+                    "imapsync",
+                    "--host1",
+                    src_imap_host,
+                    "--user1",
+                    src_imap_user,
+                    "--passfile1",
+                    str(passfile1),
+                    "--host2",
+                    args.dst_host,
+                    "--user2",
+                    args.dst_user,
+                    "--passfile2",
+                    str(passfile2),
+                    "--port1",
+                    str(args.imap_port),
+                    "--port2",
+                    str(args.dst_port),
+                ]
+                if args.src_ssl:
+                    argv.append("--ssl1")
+                if args.dst_ssl:
+                    argv.append("--ssl2")
+
+                argv += [
+                    "--syncinternaldates",
+                    "--syncflags",
+                    "--nofoldersizes",
+                    "--nofoldersizesatend",
+                ]
+
+                for extra in args.imapsync_arg or []:
+                    argv.append(extra)
+
+                try:
+                    res = run_imapsync(argv, verbose=bool(args.verbose))
+                    record(step_name, "OK", imapsync_summary_detail(res))
+                except SystemExit as e:
+                    record(step_name, "ERROR", str(e))
+                    raise
+            finally:
+                for p in (passfile1, passfile2):
+                    try:
+                        p.unlink(missing_ok=True)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+        # 3) bridge tag import (for ZWC display)
+        step += 1
+        step_name = "bridge-import-tags"
+        print(f"[{step}/{total_steps}] {step_name} (ZWC tag names/colors)")
+
+        bridge_host = (args.bridge_host or "").strip() or None
+        bridge_account_id = (args.bridge_account_id or "").strip() or None
+        bridge_username = (args.bridge_username or "").strip() or args.dst_user
+
+        if not bridge_host or not bridge_account_id:
+            base_url = (args.stalwart_base_url or "").strip() or f"https://{args.dst_host}"
+            if "://" not in base_url:
+                base_url = f"https://{base_url}"
+
+            session_url = (args.stalwart_session_url or "").strip() or None
+
+            # In dry-run, avoid prompting just to look up accountId; use only non-interactive sources.
+            password_for_session: Optional[str] = None
+            if args.dry_run:
+                if args.dst_password or args.dst_password_env or args.dst_password_file:
+                    try:
+                        password_for_session = load_secret(
+                            label="Destination password",
+                            value=args.dst_password,
+                            env=args.dst_password_env,
+                            file=args.dst_password_file,
+                            prompt=False,
+                        )
+                    except SystemExit:
+                        password_for_session = None
+            else:
+                password_for_session = dst_password
+
+            if password_for_session:
+                try:
+                    api_host, mail_account_id = stalwart_jmap_primary_mail_account(
+                        base_url=base_url,
+                        session_url=session_url,
+                        username=args.dst_user,
+                        password=password_for_session,
+                        verify_tls=not args.insecure,
+                    )
+                    if not bridge_host and api_host:
+                        bridge_host = api_host
+                    if not bridge_account_id and mail_account_id:
+                        bridge_account_id = mail_account_id
+                except SystemExit as e:
+                    eprint(f"NOTE: failed to query Stalwart JMAP session for accountId ({base_url}): {e}")
+
+        # Use a temporary tagmap file for dry-run so we don't write artifacts, but still show planned actions.
+        tagmap_json_path = out_json
+        temp_path: Optional[Path] = None
+        if args.dry_run:
+            fd, p = tempfile.mkstemp(prefix="smmailbox-tagmap-", suffix=".json", text=True)
+            os.close(fd)
+            temp_path = Path(p)
+            os.chmod(temp_path, 0o600)
+            temp_path.write_text(json.dumps(tagmap_data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            tagmap_json_path = temp_path
+
+        try:
+            bridge_args = argparse.Namespace(
+                tagmap_json=str(tagmap_json_path),
+                bridge_data_dir=args.bridge_data_dir,
+                bridge_host=bridge_host or args.dst_host,
+                bridge_username=bridge_username,
+                bridge_account_id=bridge_account_id,
+                overwrite=args.overwrite,
+                dry_run=args.dry_run,
+            )
+            try:
+                result = int(cmd_bridge_import_tags(bridge_args))
+            except SystemExit as e:
+                record(step_name, "ERROR", str(e))
+                raise
+            if result != 0:
+                record(step_name, "ERROR", f"exit={result}")
+                return finish(result)
+            record(step_name, "DRY-RUN" if args.dry_run else "OK")
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        dst_password_for_followups: Optional[str] = None
+        if args.dry_run:
+            if args.dst_password or args.dst_password_env or args.dst_password_file:
+                try:
+                    dst_password_for_followups = load_secret(
+                        label="Destination password",
+                        value=args.dst_password,
+                        env=args.dst_password_env,
+                        file=args.dst_password_file,
+                        prompt=False,
+                    )
+                except SystemExit:
+                    dst_password_for_followups = None
+        else:
+            dst_password_for_followups = dst_password
+
+        if (getattr(args, "with_filters", False) or getattr(args, "with_contacts", False) or getattr(args, "with_calendars", False)) and not dst_password_for_followups:
+            eprint(
+                "NOTE: skipping clone follow-up steps (filters/contacts/calendars): destination password not available.\n"
+                "Provide --dst-password-env/--dst-password-file or run those subcommands separately.\n"
+            )
+            if with_filters:
+                record("clone-filters", "SKIP", "destination password not available")
+            if with_contacts:
+                record("clone-contacts", "SKIP", "destination password not available")
+            if with_calendars:
+                record("clone-calendars", "SKIP", "destination password not available")
+            return finish(0)
+
+        if with_filters:
+            step += 1
+            step_name = "clone-filters"
+            print(f"[{step}/{total_steps}] {step_name} (incoming)")
+            filters_args = argparse.Namespace(
+                zimbra_host=args.zimbra_host,
+                soap_url=args.soap_url,
+                zimbra_user=args.zimbra_user,
+                zimbra_password=zimbra_password,
+                zimbra_password_env=None,
+                zimbra_password_file=None,
+                dst_host=args.dst_host,
+                dst_user=args.dst_user,
+                dst_password=dst_password_for_followups,
+                dst_password_env=None,
+                dst_password_file=None,
+                stalwart_base_url=args.stalwart_base_url,
+                stalwart_session_url=args.stalwart_session_url,
+                script_name=getattr(args, "filters_script_name", None),
+                preserve_active=bool(getattr(args, "filters_preserve_active", False)),
+                force=bool(getattr(args, "filters_force", False)),
+                insecure=args.insecure,
+                prompt_password=False,
+                dry_run=args.dry_run,
+            )
+            try:
+                result = int(cmd_clone_filters(filters_args))
+            except SystemExit as e:
+                record(step_name, "ERROR", str(e))
+                raise
+            if result != 0:
+                record(step_name, "ERROR", f"exit={result}")
+                return finish(result)
+            record(step_name, "DRY-RUN" if args.dry_run else "OK")
+
+        if with_contacts:
+            step += 1
+            step_name = "clone-contacts"
+            print(f"[{step}/{total_steps}] {step_name}")
+            contacts_args = argparse.Namespace(
+                zimbra_host=args.zimbra_host,
+                soap_url=args.soap_url,
+                zimbra_user=args.zimbra_user,
+                zimbra_password=zimbra_password,
+                zimbra_password_env=None,
+                zimbra_password_file=None,
+                dst_host=args.dst_host,
+                dst_user=args.dst_user,
+                dst_password=dst_password_for_followups,
+                dst_password_env=None,
+                dst_password_file=None,
+                stalwart_base_url=args.stalwart_base_url,
+                stalwart_session_url=args.stalwart_session_url,
+                zimbra_search_page_size=200,
+                jmap_query_page_size=500,
+                jmap_batch_size=100,
+                limit_contacts=getattr(args, "contacts_limit", None),
+                insecure=args.insecure,
+                prompt_password=False,
+                dry_run=args.dry_run,
+            )
+            try:
+                result = int(cmd_clone_contacts(contacts_args))
+            except SystemExit as e:
+                record(step_name, "ERROR", str(e))
+                raise
+            if result != 0:
+                record(step_name, "ERROR", f"exit={result}")
+                return finish(result)
+            record(step_name, "DRY-RUN" if args.dry_run else "OK")
+
+        if with_calendars:
+            step += 1
+            step_name = "clone-calendars"
+            print(f"[{step}/{total_steps}] {step_name}")
+            calendars_args = argparse.Namespace(
+                zimbra_host=args.zimbra_host,
+                soap_url=args.soap_url,
+                zimbra_user=args.zimbra_user,
+                zimbra_password=zimbra_password,
+                zimbra_password_env=None,
+                zimbra_password_file=None,
+                dst_host=args.dst_host,
+                dst_user=args.dst_user,
+                dst_password=dst_password_for_followups,
+                dst_password_env=None,
+                dst_password_file=None,
+                stalwart_base_url=args.stalwart_base_url,
+                stalwart_session_url=args.stalwart_session_url,
+                since_days=getattr(args, "calendars_since_days", 365),
+                dedupe_equal_events=bool(getattr(args, "calendars_dedupe_equal_events", False)),
+                jmap_query_page_size=500,
+                jmap_batch_size=50,
+                limit_events=getattr(args, "calendars_limit_events", None),
+                insecure=args.insecure,
+                prompt_password=False,
+                dry_run=args.dry_run,
+            )
+            try:
+                result = int(cmd_clone_calendars(calendars_args))
+            except SystemExit as e:
+                record(step_name, "ERROR", str(e))
+                raise
+            if result != 0:
+                record(step_name, "ERROR", f"exit={result}")
+                return finish(result)
+            record(step_name, "DRY-RUN" if args.dry_run else "OK")
+
+        return finish(0)
+    finally:
+        exc_type, _, _ = sys.exc_info()
+        if summaries:
+            print("\nSummary:")
+            imapsync_first: list[tuple[str, str, str]] = []
+            rest: list[tuple[str, str, str]] = []
+            for row in summaries:
+                if row[0] == "imapsync":
+                    imapsync_first.append(row)
+                else:
+                    rest.append(row)
+
+            for name, status, detail in [*imapsync_first, *rest]:
+                suffix = f" ({detail})" if detail else ""
+                print(f"- {name}: {status}{suffix}")
+        if exc_type is None and getattr(args, "clean", False) and not args.dry_run and result_code == 0:
+            removed: list[str] = []
+            for p in sorted({out_csv, out_json}):
+                try:
+                    if p.exists():
+                        p.unlink()
+                        removed.append(str(p))
+                except Exception:  # noqa: BLE001
+                    pass
+            if removed:
+                print(f"Cleaned: {', '.join(removed)}")
+
+
+def cmd_clone_filters(args: argparse.Namespace) -> int:
+    soap_url = args.soap_url or f"https://{args.zimbra_host}/service/soap"
+
+    zimbra_password = load_secret(
+        label="Zimbra password",
+        value=args.zimbra_password,
+        env=args.zimbra_password_env,
+        file=args.zimbra_password_file,
+        prompt=args.prompt_password,
+    )
+    auth_token = zimbra_soap_auth_token(
+        soap_url,
+        username=args.zimbra_user,
+        password=zimbra_password,
+        verify_tls=not args.insecure,
+    )
+    imported = zimbra_soap_get_filter_rules(
+        soap_url,
+        auth_token=auth_token,
+        verify_tls=not args.insecure,
+        outgoing=False,
+    )
+    print(f"Zimbra incoming filters: {len(imported)} rule(s)")
+    if not imported:
+        print("No incoming rules found; nothing to clone.")
+        return 0
+
+    dst_password = load_secret(
+        label="Destination password",
+        value=args.dst_password,
+        env=args.dst_password_env,
+        file=args.dst_password_file,
+        prompt=args.prompt_password,
+    )
+
+    base_url = (args.stalwart_base_url or "").strip() or f"https://{args.dst_host}"
+    if "://" not in base_url:
+        base_url = f"https://{base_url}"
+    session_url = (args.stalwart_session_url or "").strip() or None
+
+    session = stalwart_jmap_session_info(
+        base_url=base_url,
+        session_url=session_url,
+        username=args.dst_user,
+        password=dst_password,
+        verify_tls=not args.insecure,
+    )
+
+    account_id = session.sieve_account_id or session.mail_account_id
+    if not account_id:
+        raise SystemExit("Stalwart JMAP session missing both mail and sieve accountId\n")
+
+    script_name = (args.script_name or "").strip() or "zbridge-incoming-model"
+
+    existing = jmap_sieve_script_get_by_name(
+        api_url=session.api_url,
+        username=args.dst_user,
+        password=dst_password,
+        account_id=account_id,
+        script_name=script_name,
+        verify_tls=not args.insecure,
+    )
+
+    existing_id: Optional[str] = None
+    existing_text: Optional[str] = None
+    if existing:
+        existing_id = existing.get("id") if isinstance(existing.get("id"), str) else None
+        blob_id = existing.get("blobId") if isinstance(existing.get("blobId"), str) else None
+        if blob_id:
+            blob_bytes = jmap_blob_get_bytes(
+                api_url=session.api_url,
+                username=args.dst_user,
+                password=dst_password,
+                account_id=account_id,
+                blob_id=blob_id,
+                verify_tls=not args.insecure,
+            )
+            existing_text = blob_bytes.decode("utf-8", errors="replace")
+
+    if existing_text and not args.force:
+        if not any(line.strip().lower() == "# managed-by: zbridge" for line in existing_text.splitlines()):
+            raise SystemExit(
+                f"Refusing to overwrite existing SieveScript {script_name!r}: not marked '# Managed-by: zbridge'.\n"
+                "Re-run with --force to overwrite.\n"
+            )
+
+    mail_prefs = zbridge_decode_comment_json(
+        existing_text or "", prefix=ZBRIDGE_SIEVE_MAIL_PREFS_COMMENT_PREFIX
+    )
+    filter_model = zbridge_decode_comment_json(
+        existing_text or "", prefix=ZBRIDGE_SIEVE_FILTER_RULES_COMMENT_PREFIX
+    ) or {"version": 1, "updatedAt": "1970-01-01T00:00:00Z", "rules": []}
+
+    existing_rules = filter_model.get("rules")
+    if not isinstance(existing_rules, list):
+        existing_rules = []
+
+    merged_rules, actions = merge_imported_filter_rules(
+        existing_rules=existing_rules,
+        imported_rules=imported,
+        preserve_active=bool(args.preserve_active),
+        force=bool(args.force),
+    )
+
+    if not actions:
+        print("No changes needed (rules already present).")
+        return 0
+
+    filter_model["version"] = 1
+    filter_model["updatedAt"] = now_rfc3339_utc()
+    filter_model["rules"] = merged_rules
+
+    new_script = zbridge_model_only_sieve_script(
+        filter_model=filter_model,
+        mail_prefs=mail_prefs,
+        script_name=script_name,
+    )
+
+    if args.dry_run:
+        print(f"Would upsert Stalwart SieveScript {script_name!r} (accountId={account_id})")
+        for line in actions:
+            print(f"- {line}")
+        return 0
+
+    blob_id = jmap_blob_upload_text(
+        api_url=session.api_url,
+        username=args.dst_user,
+        password=dst_password,
+        account_id=account_id,
+        content_type="application/sieve",
+        text=new_script,
+        verify_tls=not args.insecure,
+    )
+    jmap_sieve_script_validate(
+        api_url=session.api_url,
+        username=args.dst_user,
+        password=dst_password,
+        account_id=account_id,
+        blob_id=blob_id,
+        verify_tls=not args.insecure,
+    )
+    jmap_sieve_script_upsert(
+        api_url=session.api_url,
+        username=args.dst_user,
+        password=dst_password,
+        account_id=account_id,
+        script_name=script_name,
+        blob_id=blob_id,
+        existing_id=existing_id,
+        verify_tls=not args.insecure,
+    )
+
+    print(f"Upserted {script_name!r} on {session.api_url} (accountId={account_id})")
+    for line in actions:
+        print(f"- {line}")
+    return 0
+
+
+def cmd_clone_contacts(args: argparse.Namespace) -> int:
+    soap_url = args.soap_url or f"https://{args.zimbra_host}/service/soap"
+
+    zimbra_password = load_secret(
+        label="Zimbra password",
+        value=args.zimbra_password,
+        env=args.zimbra_password_env,
+        file=args.zimbra_password_file,
+        prompt=args.prompt_password,
+    )
+    auth_token = zimbra_soap_auth_token(
+        soap_url,
+        username=args.zimbra_user,
+        password=zimbra_password,
+        verify_tls=not args.insecure,
+    )
+
+    folders = zimbra_soap_get_contact_folders(
+        soap_url, auth_token=auth_token, verify_tls=not args.insecure
+    )
+    # De-dupe by id and keep stable ordering by path for readability.
+    folder_by_id: dict[str, ZimbraContactFolder] = {}
+    for f in folders:
+        folder_by_id.setdefault(f.folder_id, f)
+    folders = sorted(folder_by_id.values(), key=lambda f: (f.abs_folder_path or "", f.name))
+
+    print(f"Zimbra contact folders: {len(folders)}")
+    if not folders:
+        print("No contact folders found; nothing to clone.")
+        return 0
+
+    dst_password = load_secret(
+        label="Destination password",
+        value=args.dst_password,
+        env=args.dst_password_env,
+        file=args.dst_password_file,
+        prompt=args.prompt_password,
+    )
+
+    base_url = (args.stalwart_base_url or "").strip() or f"https://{args.dst_host}"
+    if "://" not in base_url:
+        base_url = f"https://{base_url}"
+    session_url = (args.stalwart_session_url or "").strip() or None
+
+    session = stalwart_jmap_session_info(
+        base_url=base_url,
+        session_url=session_url,
+        username=args.dst_user,
+        password=dst_password,
+        verify_tls=not args.insecure,
+    )
+
+    contacts_account_id = session.contacts_account_id or session.mail_account_id
+    if not contacts_account_id:
+        raise SystemExit("Stalwart JMAP session missing contacts/mail accountId\n")
+
+    # Ensure destination address books exist.
+    books = jmap_address_book_get_all(
+        api_url=session.api_url,
+        username=args.dst_user,
+        password=dst_password,
+        account_id=contacts_account_id,
+        verify_tls=not args.insecure,
+    )
+    if not books:
+        raise SystemExit("Destination has no address books\n")
+
+    default_book_id: Optional[str] = None
+    for book in books:
+        if truthy(book.get("isDefault")) and isinstance(book.get("id"), str):
+            default_book_id = book["id"]
+            break
+    if default_book_id is None:
+        for book in books:
+            if isinstance(book.get("id"), str):
+                default_book_id = book["id"]
+                break
+    if default_book_id is None:
+        raise SystemExit("Destination address books missing an id\n")
+
+    name_to_book_id: dict[str, str] = {}
+    for book in books:
+        name = book.get("name")
+        bid = book.get("id")
+        if isinstance(name, str) and isinstance(bid, str):
+            name_to_book_id[name] = bid
+
+    book_for_folder: dict[str, str] = {}
+    planned_creates: list[str] = []
+    for folder in folders:
+        if folder.folder_id == "7":
+            book_for_folder[folder.folder_id] = default_book_id
+            continue
+
+        book_name = zimbra_contact_folder_to_address_book_name(folder)
+        existing = name_to_book_id.get(book_name)
+        if existing:
+            book_for_folder[folder.folder_id] = existing
+            continue
+
+        if args.dry_run:
+            planned_creates.append(book_name)
+            # Placeholder; unused except for debug output.
+            book_for_folder[folder.folder_id] = f"__create__:{book_name}"
+            continue
+
+        created_id = jmap_address_book_create(
+            api_url=session.api_url,
+            username=args.dst_user,
+            password=dst_password,
+            account_id=contacts_account_id,
+            name=book_name,
+            verify_tls=not args.insecure,
+        )
+        name_to_book_id[book_name] = created_id
+        book_for_folder[folder.folder_id] = created_id
+        print(f"Created address book: {book_name!r} ({created_id})")
+
+    if planned_creates:
+        for name in planned_creates:
+            print(f"Would create address book: {name!r}")
+
+    # Build uid -> card id mapping for idempotent upsert.
+    existing_uids: dict[str, str] = {}
+    existing_ids = jmap_contact_card_query_all_ids(
+        api_url=session.api_url,
+        username=args.dst_user,
+        password=dst_password,
+        account_id=contacts_account_id,
+        page_size=max(1, int(args.jmap_query_page_size)),
+        verify_tls=not args.insecure,
+    )
+    for chunk in chunks(existing_ids, 200):
+        cards = jmap_contact_card_get(
+            api_url=session.api_url,
+            username=args.dst_user,
+            password=dst_password,
+            account_id=contacts_account_id,
+            ids=list(chunk),
+            properties=["id", "uid"],
+            verify_tls=not args.insecure,
+        )
+        for card in cards:
+            uid = card.get("uid")
+            cid = card.get("id")
+            if isinstance(uid, str) and uid.strip() and isinstance(cid, str) and cid.strip():
+                existing_uids.setdefault(uid.strip(), cid.strip())
+
+    print(f"Destination contacts with uid: {len(existing_uids)}")
+
+    managed_props = [
+        "uid",
+        "name",
+        "emails",
+        "phones",
+        "addresses",
+        "anniversaries",
+        "links",
+        "organizations",
+        "titles",
+        "nicknames",
+        "notes",
+        "addressBookIds",
+    ]
+
+    def card_from_zimbra(contact: ZimbraContact, *, address_book_id: str) -> dict:
+        stable_uid = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"zimbra:{args.zimbra_host}:{args.zimbra_user}:contact:{contact.contact_id}",
+            )
+        )
+        card: dict[str, object] = {"@type": "Card", "uid": stable_uid, "addressBookIds": {address_book_id: True}}
+
+        attrs = contact.attrs
+        name = jscontact_name_from_attrs(attrs)
+        if name is not None:
+            card["name"] = name
+        nicknames = jscontact_nicknames_from_attrs(attrs)
+        if nicknames is not None:
+            card["nicknames"] = nicknames
+        notes = jscontact_notes_from_attrs(attrs)
+        if notes is not None:
+            card["notes"] = notes
+        orgs = jscontact_organizations_from_attrs(attrs)
+        if orgs is not None:
+            card["organizations"] = orgs
+        titles = jscontact_titles_from_attrs(attrs)
+        if titles is not None:
+            card["titles"] = titles
+        emails = jscontact_emails_from_attrs(attrs)
+        if emails is not None:
+            card["emails"] = emails
+        phones = jscontact_phones_from_attrs(attrs)
+        if phones is not None:
+            card["phones"] = phones
+        addresses = jscontact_addresses_from_attrs(attrs)
+        if addresses is not None:
+            card["addresses"] = addresses
+        links = jscontact_links_from_attrs(attrs)
+        if links is not None:
+            card["links"] = links
+        anniversaries = jscontact_anniversaries_from_attrs(attrs)
+        if anniversaries is not None:
+            card["anniversaries"] = anniversaries
+
+        return card
+
+    def patch_from_card(card: dict) -> dict:
+        patch: dict[str, object] = {}
+        for key in managed_props:
+            patch[key] = card.get(key) if key in card else None
+        return patch
+
+    create_ops: dict[str, dict] = {}
+    create_key_to_uid: dict[str, str] = {}
+    update_ops: dict[str, dict] = {}
+
+    created = 0
+    updated = 0
+    total = 0
+
+    def flush() -> None:
+        nonlocal create_ops, create_key_to_uid, update_ops, created, updated
+        if not create_ops and not update_ops:
+            return
+        if args.dry_run:
+            create_ops = {}
+            create_key_to_uid = {}
+            update_ops = {}
+            return
+
+        payload = jmap_contact_card_set(
+            api_url=session.api_url,
+            username=args.dst_user,
+            password=dst_password,
+            account_id=contacts_account_id,
+            create=create_ops,
+            update=update_ops,
+            verify_tls=not args.insecure,
+        )
+        not_created = payload.get("notCreated")
+        if isinstance(not_created, dict) and not_created:
+            first = next(iter(not_created.values()))
+            raise SystemExit(f"ContactCard/create failed: {jmap_describe_set_error(first)}\n")
+        not_updated = payload.get("notUpdated")
+        if isinstance(not_updated, dict) and not_updated:
+            first = next(iter(not_updated.values()))
+            raise SystemExit(f"ContactCard/update failed: {jmap_describe_set_error(first)}\n")
+
+        created_map = payload.get("created")
+        if isinstance(created_map, dict):
+            for create_key, obj in created_map.items():
+                if not isinstance(obj, dict):
+                    continue
+                new_id = obj.get("id")
+                if not isinstance(new_id, str):
+                    continue
+                uid = create_key_to_uid.get(create_key)
+                if uid:
+                    existing_uids[uid] = new_id
+
+        create_ops = {}
+        create_key_to_uid = {}
+        update_ops = {}
+
+    zimbra_limit = max(1, int(args.zimbra_search_page_size))
+    jmap_batch_size = max(1, int(args.jmap_batch_size))
+    max_contacts = int(args.limit_contacts) if args.limit_contacts is not None else None
+
+    for folder in folders:
+        offset = 0
+        while True:
+            ids, more = zimbra_soap_search_contact_ids(
+                soap_url,
+                auth_token=auth_token,
+                folder_id=folder.folder_id,
+                limit=zimbra_limit,
+                offset=offset,
+                verify_tls=not args.insecure,
+            )
+            if not ids:
+                break
+            offset += len(ids)
+
+            contacts = zimbra_soap_get_contacts_by_ids(
+                soap_url, auth_token=auth_token, ids=ids, verify_tls=not args.insecure
+            )
+            for contact in contacts:
+                if max_contacts is not None and total >= max_contacts:
+                    break
+
+                folder_id = contact.folder_id or folder.folder_id
+                address_book_id = book_for_folder.get(folder_id, default_book_id)
+                card = card_from_zimbra(contact, address_book_id=address_book_id)
+                uid = str(card["uid"])
+                existing_id = existing_uids.get(uid)
+
+                if existing_id:
+                    update_ops[existing_id] = patch_from_card(card)
+                    updated += 1
+                else:
+                    create_key = f"k{len(create_ops)}"
+                    create_ops[create_key] = card
+                    create_key_to_uid[create_key] = uid
+                    created += 1
+
+                total += 1
+                if (len(create_ops) + len(update_ops)) >= jmap_batch_size:
+                    flush()
+
+            if max_contacts is not None and total >= max_contacts:
+                break
+            if not more:
+                break
+
+        if max_contacts is not None and total >= max_contacts:
+            break
+
+    flush()
+
+    if args.dry_run:
+        print(f"Would upsert {total} contact(s): {created} create, {updated} update")
+    else:
+        print(f"Upserted {total} contact(s): {created} create, {updated} update")
+
+    return 0
+
+
+def cmd_clone_calendars(args: argparse.Namespace) -> int:
+    soap_url = args.soap_url or f"https://{args.zimbra_host}/service/soap"
+
+    zimbra_password = load_secret(
+        label="Zimbra password",
+        value=args.zimbra_password,
+        env=args.zimbra_password_env,
+        file=args.zimbra_password_file,
+        prompt=args.prompt_password,
+    )
+    auth_token = zimbra_soap_auth_token(
+        soap_url,
+        username=args.zimbra_user,
+        password=zimbra_password,
+        verify_tls=not args.insecure,
+    )
+
+    folders = zimbra_soap_get_calendar_folders(
+        soap_url, auth_token=auth_token, verify_tls=not args.insecure
+    )
+    folder_by_id: dict[str, ZimbraCalendarFolder] = {}
+    for f in folders:
+        folder_by_id.setdefault(f.folder_id, f)
+    folders = sorted(folder_by_id.values(), key=lambda f: (f.abs_folder_path or "", f.name))
+
+    print(f"Zimbra calendars: {len(folders)}")
+    if not folders:
+        print("No calendars found; nothing to clone.")
+        return 0
+
+    dst_password = load_secret(
+        label="Destination password",
+        value=args.dst_password,
+        env=args.dst_password_env,
+        file=args.dst_password_file,
+        prompt=args.prompt_password,
+    )
+
+    base_url = (args.stalwart_base_url or "").strip() or f"https://{args.dst_host}"
+    if "://" not in base_url:
+        base_url = f"https://{base_url}"
+    session_url = (args.stalwart_session_url or "").strip() or None
+
+    session = stalwart_jmap_session_info(
+        base_url=base_url,
+        session_url=session_url,
+        username=args.dst_user,
+        password=dst_password,
+        verify_tls=not args.insecure,
+    )
+
+    account_id = session.mail_account_id
+    if not account_id:
+        raise SystemExit("Stalwart JMAP session missing mail accountId\n")
+
+    since_days = max(0, int(args.since_days))
+    now_utc = datetime.now(timezone.utc)
+    min_start_utc = now_utc - timedelta(days=since_days)
+    min_start_rfc3339 = min_start_utc.isoformat().replace("+00:00", "Z")
+
+    # Ensure destination calendars exist.
+    cal_list = jmap_calendar_get_all(
+        api_url=session.api_url,
+        username=args.dst_user,
+        password=dst_password,
+        account_id=account_id,
+        verify_tls=not args.insecure,
+    )
+    if not cal_list:
+        raise SystemExit("Destination has no calendars\n")
+
+    default_cal_id = jmap_default_calendar_id(cal_list)
+
+    name_to_cal_id: dict[str, str] = {}
+    for cal in cal_list:
+        name = cal.get("name")
+        cid = cal.get("id")
+        if isinstance(name, str) and isinstance(cid, str):
+            name_to_cal_id[name] = cid
+
+    cal_for_folder: dict[str, str] = {}
+    planned_creates: list[str] = []
+    for folder in folders:
+        if folder.folder_id == "10":
+            cal_for_folder[folder.folder_id] = default_cal_id
+            continue
+
+        cal_name = zimbra_calendar_folder_to_calendar_name(folder)
+        existing = name_to_cal_id.get(cal_name)
+        if existing:
+            cal_for_folder[folder.folder_id] = existing
+            continue
+
+        if args.dry_run:
+            planned_creates.append(cal_name)
+            cal_for_folder[folder.folder_id] = f"__create__:{cal_name}"
+            continue
+
+        created_id = jmap_calendar_create(
+            api_url=session.api_url,
+            username=args.dst_user,
+            password=dst_password,
+            account_id=account_id,
+            name=cal_name,
+            verify_tls=not args.insecure,
+        )
+        name_to_cal_id[cal_name] = created_id
+        cal_for_folder[folder.folder_id] = created_id
+        print(f"Created calendar: {cal_name!r} ({created_id})")
+
+    if planned_creates:
+        for name in planned_creates:
+            print(f"Would create calendar: {name!r}")
+
+    page_size = max(1, int(args.jmap_query_page_size))
+    # Build a destination uid->eventId index across all calendars (within since-days window).
+    ids = jmap_calendar_event_query_all_ids(
+        api_url=session.api_url,
+        username=args.dst_user,
+        password=dst_password,
+        account_id=account_id,
+        filter_obj={"after": min_start_rfc3339},
+        page_size=page_size,
+        verify_tls=not args.insecure,
+    )
+    uid_index: dict[str, str] = {}
+    for chunk in chunks(ids, 200):
+        events = jmap_calendar_event_get(
+            api_url=session.api_url,
+            username=args.dst_user,
+            password=dst_password,
+            account_id=account_id,
+            ids=list(chunk),
+            properties=["id", "uid"],
+            verify_tls=not args.insecure,
+        )
+        for ev in events:
+            uid = ev.get("uid")
+            eid = ev.get("id")
+            if isinstance(uid, str) and uid.strip() and isinstance(eid, str) and eid.strip():
+                uid_index.setdefault(uid.strip(), eid.strip())
+
+    managed_count = 0
+    created = 0
+    updated = 0
+    estimated_events = 0
+    skipped_duplicates = 0
+
+    create_ops: dict[str, dict] = {}
+    create_key_to_uid: dict[str, str] = {}
+    update_ops: dict[str, dict] = {}
+
+    max_events = int(args.limit_events) if args.limit_events is not None else None
+    jmap_batch_size = max(1, int(args.jmap_batch_size))
+
+    def flush() -> None:
+        nonlocal create_ops, create_key_to_uid, update_ops, created, updated
+        if not create_ops and not update_ops:
+            return
+        if args.dry_run:
+            create_ops = {}
+            create_key_to_uid = {}
+            update_ops = {}
+            return
+
+        payload = jmap_calendar_event_set(
+            api_url=session.api_url,
+            username=args.dst_user,
+            password=dst_password,
+            account_id=account_id,
+            create=create_ops,
+            update=update_ops,
+            send_scheduling_messages=False,
+            verify_tls=not args.insecure,
+        )
+        not_created = payload.get("notCreated")
+        if isinstance(not_created, dict) and not_created:
+            first = next(iter(not_created.values()))
+            raise SystemExit(f"CalendarEvent/create failed: {jmap_describe_set_error(first)}\n")
+        not_updated = payload.get("notUpdated")
+        if isinstance(not_updated, dict) and not_updated:
+            first = next(iter(not_updated.values()))
+            raise SystemExit(f"CalendarEvent/update failed: {jmap_describe_set_error(first)}\n")
+
+        created_map = payload.get("created")
+        if isinstance(created_map, dict):
+            for create_key, obj in created_map.items():
+                if not isinstance(obj, dict):
+                    continue
+                new_id = obj.get("id")
+                if not isinstance(new_id, str):
+                    continue
+                uid = create_key_to_uid.get(create_key)
+                if not uid:
+                    continue
+                uid_index.setdefault(uid, new_id)
+
+        create_ops = {}
+        create_key_to_uid = {}
+        update_ops = {}
+
+    for folder in folders:
+        cal_id = cal_for_folder.get(folder.folder_id, default_cal_id)
+        if cal_id.startswith("__create__:"):
+            # dry-run placeholder
+            cal_id = default_cal_id
+
+        ics = zimbra_rest_export_ics(
+            zimbra_host=args.zimbra_host,
+            zimbra_user=args.zimbra_user,
+            abs_folder_path=folder.abs_folder_path,
+            auth_token=auth_token,
+            verify_tls=not args.insecure,
+        )
+        if not ics.strip():
+            continue
+
+        if args.dry_run:
+            # Avoid uploading/parsing during dry-run; estimate with a cheap hint.
+            count = ics.count(b"BEGIN:VEVENT")
+            estimated_events += count
+            print(
+                f"Would import ~{count} event(s) from {folder.abs_folder_path!r} into calendar {cal_id}"
+            )
+            continue
+
+        blob_id = jmap_blob_upload_bytes(
+            api_url=session.api_url,
+            username=args.dst_user,
+            password=dst_password,
+            account_id=account_id,
+            content_type="text/calendar",
+            data=ics,
+            verify_tls=not args.insecure,
+        )
+        parsed_events = jmap_calendar_event_parse(
+            api_url=session.api_url,
+            username=args.dst_user,
+            password=dst_password,
+            account_id=account_id,
+            blob_id=blob_id,
+            verify_tls=not args.insecure,
+        )
+
+        seen_dedupe_keys: set[str] = set()
+        for ev in parsed_events:
+            if max_events is not None and managed_count >= max_events:
+                break
+
+            start = ev.get("start")
+            tzid = ev.get("timeZone") if isinstance(ev.get("timeZone"), str) else "Etc/UTC"
+            if isinstance(start, str) and start.strip():
+                start_utc = jmap_local_datetime_to_utc(start, str(tzid))
+                if start_utc < min_start_utc:
+                    continue
+
+            uid = ev.get("uid") if isinstance(ev.get("uid"), str) and ev.get("uid").strip() else None
+            if uid is None:
+                title = ev.get("title") if isinstance(ev.get("title"), str) else ""
+                seed = f"zimbra:{args.zimbra_host}:{args.zimbra_user}:{folder.abs_folder_path}:{start}:{title}"
+                uid = str(uuid.uuid5(uuid.NAMESPACE_URL, seed))
+            uid = uid.strip()
+
+            create_obj = jmap_calendar_event_create_from_parsed(ev, calendar_id=cal_id, stable_uid=uid)
+            if args.dedupe_equal_events:
+                key = calendar_event_dedupe_key(create_obj)
+                if key in seen_dedupe_keys:
+                    skipped_duplicates += 1
+                    continue
+                seen_dedupe_keys.add(key)
+            existing_id = uid_index.get(uid)
+            if existing_id:
+                update_ops[existing_id] = create_obj
+                updated += 1
+            else:
+                create_key = f"k{len(create_ops)}"
+                create_ops[create_key] = create_obj
+                create_key_to_uid[create_key] = uid
+                created += 1
+
+            managed_count += 1
+            if (len(create_ops) + len(update_ops)) >= jmap_batch_size:
+                flush()
+
+        flush()
+
+        if max_events is not None and managed_count >= max_events:
+            break
+
+    flush()
+
+    if args.dry_run:
+        managed = estimated_events if estimated_events else managed_count
+        print(f"Would upsert ~{managed} event(s) (create/update counts require a real run)")
+    else:
+        print(f"Upserted {managed_count} event(s): {created} create, {updated} update")
+        if args.dedupe_equal_events and skipped_duplicates:
+            print(f"Skipped {skipped_duplicates} duplicate event(s) during import")
+
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="smmailbox",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=textwrap.dedent(
+            """\
+            smmailbox: Stalwart migration helper (phase 1).
+
+            This is intended as a *local* CLI (run over SSH), not a network API.
+            """
+        ),
+    )
+    p.add_argument(
+        "--version",
+        action="version",
+        version="\n".join(
+            [
+                f"smmailbox {__version__}",
+                f"Maintainer: {__maintainer__}",
+                f"License: {__license__}",
+                f"AI assistance: {__ai_assistance__}",
+            ]
+        ),
+        help="show version and attribution info",
+    )
+    p.add_argument("--dry-run", action="store_true", help="print commands without executing")
+    p.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="verbose output (pass through full imapsync output)",
+    )
+    p.add_argument(
+        "--init",
+        action="store_true",
+        help="install/check dependencies (alias for: init)",
+    )
+
+    sub = p.add_subparsers(dest="cmd")
+
+    init = sub.add_parser("init", help="install/check dependencies (imapsync)")
+    init.set_defaults(func=cmd_init)
+
+    tags = sub.add_parser("export-tag-map", help="export Zimbra tags (SOAP) + IMAP keyword mapping")
+    tags.add_argument(
+        "--src-host",
+        "--zimbra-host",
+        dest="zimbra_host",
+        required=True,
+        help="Source host (Zimbra; used for SOAP and default IMAP)",
+    )
+    tags.add_argument("--soap-url", help="override SOAP URL (default: https://<host>/service/soap)")
+    tags.add_argument(
+        "--src-user",
+        "--zimbra-user",
+        dest="zimbra_user",
+        required=True,
+        help="Source username/email (Zimbra)",
+    )
+    tags.add_argument(
+        "--src-password",
+        "--zimbra-password",
+        dest="zimbra_password",
+        help="Source password (discouraged; prefer env/file/prompt)",
+    )
+    tags.add_argument(
+        "--src-password-env",
+        "--zimbra-password-env",
+        dest="zimbra_password_env",
+        help="read source password from env var",
+    )
+    tags.add_argument(
+        "--src-password-file",
+        "--zimbra-password-file",
+        dest="zimbra_password_file",
+        help="read source password from a file (first line)",
+    )
+    tags.add_argument("--imap-host", help="source IMAP host (default: same as --src-host)")
+    tags.add_argument("--imap-port", type=int, default=993, help="IMAP port (default: 993)")
+    tags.add_argument("--imap-user", help="source IMAP username (default: same as --src-user)")
+    tags.add_argument("--imap-password", help="source IMAP password (default: same as source password)")
+    tags.add_argument("--imap-password-env", help="read IMAP password from env var")
+    tags.add_argument("--imap-password-file", help="read IMAP password from a file (first line)")
+    tags.add_argument("--imap-mailbox", default="INBOX", help="mailbox to SELECT for FLAGS (default: INBOX)")
+    tags.add_argument("--out-csv", default="tagmap.csv", help="output CSV path (default: tagmap.csv)")
+    tags.add_argument("--out-json", help="output JSON path (default: <out-csv>.json)")
+    tags.add_argument("--insecure", action="store_true", help="disable TLS verification (SOAP+IMAP)")
+    tags.add_argument("--prompt-password", action="store_true", help="prompt for passwords if not provided")
+    tags.set_defaults(func=cmd_export_zimbra_tag_map)
+
+    clone_parent = argparse.ArgumentParser(add_help=False)
+    clone_parent.add_argument(
+        "--src-host",
+        "--zimbra-host",
+        dest="zimbra_host",
+        required=True,
+        help="Source host (Zimbra; used for SOAP and default IMAP)",
+    )
+    clone_parent.add_argument("--soap-url", help="override SOAP URL (default: https://<host>/service/soap)")
+    clone_parent.add_argument(
+        "--src-user",
+        "--zimbra-user",
+        dest="zimbra_user",
+        required=True,
+        help="Source username/email (Zimbra)",
+    )
+    clone_parent.add_argument(
+        "--src-password",
+        "--zimbra-password",
+        dest="zimbra_password",
+        help="Source password (discouraged; prefer env/file/prompt)",
+    )
+    clone_parent.add_argument(
+        "--src-password-env",
+        "--zimbra-password-env",
+        dest="zimbra_password_env",
+        help="read source password from env var",
+    )
+    clone_parent.add_argument(
+        "--src-password-file",
+        "--zimbra-password-file",
+        dest="zimbra_password_file",
+        help="read source password from a file (first line)",
+    )
+
+    clone_parent.add_argument("--imap-host", help="source IMAP host (default: same as --src-host)")
+    clone_parent.add_argument("--imap-port", type=int, default=993, help="source IMAP port (default: 993)")
+    clone_parent.add_argument("--imap-user", help="source IMAP username (default: same as --src-user)")
+    clone_parent.add_argument("--imap-password", help="source IMAP password (default: same as source password)")
+    clone_parent.add_argument("--imap-password-env", help="read source IMAP password from env var")
+    clone_parent.add_argument("--imap-password-file", help="read source IMAP password from a file (first line)")
+    clone_parent.add_argument("--imap-mailbox", default="INBOX", help="mailbox to SELECT for FLAGS (default: INBOX)")
+
+    clone_parent.add_argument("--dst-host", required=True, help="destination IMAP host (Stalwart)")
+    clone_parent.add_argument("--dst-port", type=int, default=993, help="destination IMAP port (default: 993)")
+    clone_parent.add_argument("--dst-user", required=True, help="destination user")
+    clone_parent.add_argument("--dst-password", help="destination password (discouraged; prefer env/file/prompt)")
+    clone_parent.add_argument("--dst-password-env", help="read destination password from env var")
+    clone_parent.add_argument("--dst-password-file", help="read destination password from a file (first line)")
+
+    clone_parent.add_argument("--src-ssl", dest="src_ssl", action="store_true", help="use SSL for source (default)")
+    clone_parent.add_argument("--no-src-ssl", dest="src_ssl", action="store_false", help="disable SSL for source")
+    clone_parent.set_defaults(src_ssl=True)
+    clone_parent.add_argument("--dst-ssl", dest="dst_ssl", action="store_true", help="use SSL for destination (default)")
+    clone_parent.add_argument("--no-dst-ssl", dest="dst_ssl", action="store_false", help="disable SSL for destination")
+    clone_parent.set_defaults(dst_ssl=True)
+
+    clone_parent.add_argument(
+        "--out-csv",
+        default="tagmap.csv",
+        help="tag mapping CSV output path (default: tagmap.csv)",
+    )
+    clone_parent.add_argument("--out-json", help="tag mapping JSON output path (default: <out-csv>.json)")
+    clone_parent.add_argument(
+        "--clean",
+        action="store_true",
+        help="remove tag mapping CSV/JSON after a successful clone (useful for scripting)",
+    )
+
+    default_data_dir = (Path(__file__).resolve().parents[1] / ".dev" / "data").as_posix()
+    clone_parent.add_argument(
+        "--bridge-data-dir",
+        default=os.environ.get("BRIDGE_DATA_DIR", default_data_dir),
+        help="Project-Z-Bridge BRIDGE_DATA_DIR (default: repo .dev/data)",
+    )
+    clone_parent.add_argument(
+        "--bridge-host",
+        help="override host used for bridge storage key (default: derived from Stalwart JMAP apiUrl)",
+    )
+    clone_parent.add_argument("--bridge-username", help="bridge login username/email (default: --dst-user)")
+    clone_parent.add_argument(
+        "--bridge-account-id",
+        help="Stalwart JMAP mail accountId (default: derived from JMAP session; fallback: infer from bridge state / default c)",
+    )
+    clone_parent.add_argument("--stalwart-base-url", help="Stalwart base URL (default: https://<dst-host>)")
+    clone_parent.add_argument(
+        "--stalwart-session-url",
+        help="override Stalwart JMAP session URL (default: <base>/.well-known/jmap)",
+    )
+
+    clone_parent.add_argument(
+        "--with-filters",
+        dest="with_filters",
+        action="store_true",
+        help="also clone incoming filters (same as: clone-filters)",
+    )
+    clone_parent.add_argument(
+        "--no-filters",
+        dest="with_filters",
+        action="store_false",
+        help="skip cloning filters",
+    )
+    clone_parent.add_argument(
+        "--filters-script-name",
+        default="zbridge-incoming-model",
+        help="destination SieveScript name for imported filter model (default: zbridge-incoming-model)",
+    )
+    clone_parent.add_argument(
+        "--filters-preserve-active",
+        action="store_true",
+        help="preserve Zimbra rule active/disabled state when importing filters (default: import everything inactive)",
+    )
+    clone_parent.add_argument(
+        "--filters-force",
+        action="store_true",
+        help="allow overwriting active/conflicting rules and non-zbridge scripts when cloning filters (dangerous)",
+    )
+
+    clone_parent.add_argument(
+        "--with-contacts",
+        dest="with_contacts",
+        action="store_true",
+        help="also clone contacts/address books (same as: clone-contacts)",
+    )
+    clone_parent.add_argument(
+        "--no-contacts",
+        dest="with_contacts",
+        action="store_false",
+        help="skip cloning contacts",
+    )
+    clone_parent.add_argument("--contacts-limit", type=int, help="limit contacts processed (debug/testing)")
+
+    clone_parent.add_argument(
+        "--with-calendars",
+        dest="with_calendars",
+        action="store_true",
+        help="also clone calendars/events (same as: clone-calendars)",
+    )
+    clone_parent.add_argument(
+        "--no-calendars",
+        dest="with_calendars",
+        action="store_false",
+        help="skip cloning calendars",
+    )
+    clone_parent.add_argument(
+        "--calendars-since-days",
+        type=int,
+        default=365,
+        help="import calendar events starting after now-N days (default: 365)",
+    )
+    clone_parent.add_argument(
+        "--calendars-dedupe-equal-events",
+        action="store_true",
+        help="skip exact duplicate VEVENTs (same content but different UID) within an ICS export",
+    )
+    clone_parent.add_argument(
+        "--calendars-limit-events",
+        type=int,
+        help="limit total calendar events processed (debug/testing)",
+    )
+
+    clone_parent.add_argument("--overwrite", action="store_true", help="overwrite existing bridge tag keyword/color by name")
+    clone_parent.add_argument("--imapsync-arg", action="append", help="extra raw argument to pass to imapsync (repeatable)")
+    clone_parent.add_argument("--insecure", action="store_true", help="disable TLS verification (SOAP+IMAP+JMAP)")
+    clone_parent.add_argument("--prompt-password", action="store_true", help="prompt for passwords if not provided")
+
+    clone = sub.add_parser(
+        "clone",
+        parents=[clone_parent],
+        help="clone from Zimbra to Stalwart (phase 1: tags + mail/folders/flags + bridge tag import)",
+    )
+    clone.set_defaults(func=cmd_clone, with_filters=False, with_contacts=False, with_calendars=False)
+
+    clone_all = sub.add_parser(
+        "clone-all",
+        parents=[clone_parent],
+        help="clone everything from Zimbra to Stalwart (tags + mail + filters + contacts + calendars)",
+    )
+    clone_all.set_defaults(func=cmd_clone, with_filters=True, with_contacts=True, with_calendars=True)
+
+    clone_filters = sub.add_parser(
+        "clone-filters",
+        help="clone incoming filters from Zimbra into Stalwart (imports into ZWC 'Available Filters' by default)",
+    )
+    clone_filters.add_argument(
+        "--src-host",
+        "--zimbra-host",
+        dest="zimbra_host",
+        required=True,
+        help="Zimbra host (SOAP)",
+    )
+    clone_filters.add_argument("--soap-url", help="override SOAP URL (default: https://<host>/service/soap)")
+    clone_filters.add_argument(
+        "--src-user",
+        "--zimbra-user",
+        dest="zimbra_user",
+        required=True,
+        help="Zimbra username/email",
+    )
+    clone_filters.add_argument(
+        "--src-password",
+        "--zimbra-password",
+        dest="zimbra_password",
+        help="Zimbra password (discouraged; prefer env/file/prompt)",
+    )
+    clone_filters.add_argument(
+        "--src-password-env",
+        "--zimbra-password-env",
+        dest="zimbra_password_env",
+        help="read Zimbra password from env var",
+    )
+    clone_filters.add_argument(
+        "--src-password-file",
+        "--zimbra-password-file",
+        dest="zimbra_password_file",
+        help="read Zimbra password from a file (first line)",
+    )
+
+    clone_filters.add_argument("--dst-host", required=True, help="destination host (Stalwart)")
+    clone_filters.add_argument("--dst-user", required=True, help="destination user")
+    clone_filters.add_argument("--dst-password", help="destination password (discouraged; prefer env/file/prompt)")
+    clone_filters.add_argument("--dst-password-env", help="read destination password from env var")
+    clone_filters.add_argument("--dst-password-file", help="read destination password from a file (first line)")
+    clone_filters.add_argument("--stalwart-base-url", help="Stalwart base URL (default: https://<dst-host>)")
+    clone_filters.add_argument(
+        "--stalwart-session-url",
+        help="override Stalwart JMAP session URL (default: <base>/.well-known/jmap)",
+    )
+
+    clone_filters.add_argument(
+        "--script-name",
+        default="zbridge-incoming-model",
+        help="destination SieveScript name to store the zbridge filter model (default: zbridge-incoming-model)",
+    )
+    clone_filters.add_argument(
+        "--preserve-active",
+        action="store_true",
+        help="preserve Zimbra rule active/disabled state (default: import everything inactive)",
+    )
+    clone_filters.add_argument(
+        "--force",
+        action="store_true",
+        help="allow overwriting active/conflicting rules and non-zbridge scripts (dangerous)",
+    )
+    clone_filters.add_argument("--insecure", action="store_true", help="disable TLS verification (SOAP+JMAP)")
+    clone_filters.add_argument("--prompt-password", action="store_true", help="prompt for passwords if not provided")
+    clone_filters.set_defaults(func=cmd_clone_filters)
+
+    clone_contacts = sub.add_parser(
+        "clone-contacts",
+        help="clone contacts/address books from Zimbra into Stalwart (JMAP contacts)",
+    )
+    clone_contacts.add_argument(
+        "--src-host",
+        "--zimbra-host",
+        dest="zimbra_host",
+        required=True,
+        help="Zimbra host (SOAP)",
+    )
+    clone_contacts.add_argument("--soap-url", help="override SOAP URL (default: https://<host>/service/soap)")
+    clone_contacts.add_argument(
+        "--src-user",
+        "--zimbra-user",
+        dest="zimbra_user",
+        required=True,
+        help="Zimbra username/email",
+    )
+    clone_contacts.add_argument(
+        "--src-password",
+        "--zimbra-password",
+        dest="zimbra_password",
+        help="Zimbra password (discouraged; prefer env/file/prompt)",
+    )
+    clone_contacts.add_argument(
+        "--src-password-env",
+        "--zimbra-password-env",
+        dest="zimbra_password_env",
+        help="read Zimbra password from env var",
+    )
+    clone_contacts.add_argument(
+        "--src-password-file",
+        "--zimbra-password-file",
+        dest="zimbra_password_file",
+        help="read Zimbra password from a file (first line)",
+    )
+
+    clone_contacts.add_argument("--dst-host", required=True, help="destination host (Stalwart)")
+    clone_contacts.add_argument("--dst-user", required=True, help="destination user")
+    clone_contacts.add_argument("--dst-password", help="destination password (discouraged; prefer env/file/prompt)")
+    clone_contacts.add_argument("--dst-password-env", help="read destination password from env var")
+    clone_contacts.add_argument("--dst-password-file", help="read destination password from a file (first line)")
+    clone_contacts.add_argument("--stalwart-base-url", help="Stalwart base URL (default: https://<dst-host>)")
+    clone_contacts.add_argument(
+        "--stalwart-session-url",
+        help="override Stalwart JMAP session URL (default: <base>/.well-known/jmap)",
+    )
+
+    clone_contacts.add_argument(
+        "--zimbra-search-page-size",
+        type=int,
+        default=200,
+        help="Zimbra SearchRequest page size (default: 200)",
+    )
+    clone_contacts.add_argument(
+        "--jmap-query-page-size",
+        type=int,
+        default=500,
+        help="JMAP ContactCard/query page size when indexing existing contacts (default: 500)",
+    )
+    clone_contacts.add_argument(
+        "--jmap-batch-size",
+        type=int,
+        default=100,
+        help="JMAP ContactCard/set batch size (create+update) (default: 100)",
+    )
+    clone_contacts.add_argument(
+        "--limit-contacts",
+        type=int,
+        help="limit total contacts processed (debug/testing)",
+    )
+
+    clone_contacts.add_argument("--insecure", action="store_true", help="disable TLS verification (SOAP+JMAP)")
+    clone_contacts.add_argument("--prompt-password", action="store_true", help="prompt for passwords if not provided")
+    clone_contacts.set_defaults(func=cmd_clone_contacts)
+
+    clone_cal = sub.add_parser(
+        "clone-calendars",
+        help="clone calendars/events from Zimbra into Stalwart (ICS export + JMAP calendars)",
+    )
+    clone_cal.add_argument(
+        "--src-host",
+        "--zimbra-host",
+        dest="zimbra_host",
+        required=True,
+        help="Zimbra host (SOAP + /home export)",
+    )
+    clone_cal.add_argument("--soap-url", help="override SOAP URL (default: https://<host>/service/soap)")
+    clone_cal.add_argument(
+        "--src-user",
+        "--zimbra-user",
+        dest="zimbra_user",
+        required=True,
+        help="Zimbra username/email",
+    )
+    clone_cal.add_argument(
+        "--src-password",
+        "--zimbra-password",
+        dest="zimbra_password",
+        help="Zimbra password (discouraged; prefer env/file/prompt)",
+    )
+    clone_cal.add_argument(
+        "--src-password-env",
+        "--zimbra-password-env",
+        dest="zimbra_password_env",
+        help="read Zimbra password from env var",
+    )
+    clone_cal.add_argument(
+        "--src-password-file",
+        "--zimbra-password-file",
+        dest="zimbra_password_file",
+        help="read Zimbra password from a file (first line)",
+    )
+
+    clone_cal.add_argument("--dst-host", required=True, help="destination host (Stalwart)")
+    clone_cal.add_argument("--dst-user", required=True, help="destination user")
+    clone_cal.add_argument("--dst-password", help="destination password (discouraged; prefer env/file/prompt)")
+    clone_cal.add_argument("--dst-password-env", help="read destination password from env var")
+    clone_cal.add_argument("--dst-password-file", help="read destination password from a file (first line)")
+    clone_cal.add_argument("--stalwart-base-url", help="Stalwart base URL (default: https://<dst-host>)")
+    clone_cal.add_argument(
+        "--stalwart-session-url",
+        help="override Stalwart JMAP session URL (default: <base>/.well-known/jmap)",
+    )
+
+    clone_cal.add_argument(
+        "--since-days",
+        type=int,
+        default=365,
+        help="import events starting after now-N days (default: 365)",
+    )
+    clone_cal.add_argument(
+        "--dedupe-equal-events",
+        action="store_true",
+        help="skip exact duplicate VEVENTs (same content but different UID) within an ICS export",
+    )
+    clone_cal.add_argument(
+        "--jmap-query-page-size",
+        type=int,
+        default=500,
+        help="JMAP CalendarEvent/query page size when indexing existing events (default: 500)",
+    )
+    clone_cal.add_argument(
+        "--jmap-batch-size",
+        type=int,
+        default=50,
+        help="JMAP CalendarEvent/set batch size (create+update) (default: 50)",
+    )
+    clone_cal.add_argument(
+        "--limit-events",
+        type=int,
+        help="limit total events processed (debug/testing)",
+    )
+
+    clone_cal.add_argument("--insecure", action="store_true", help="disable TLS verification (SOAP+REST+JMAP)")
+    clone_cal.add_argument("--prompt-password", action="store_true", help="prompt for passwords if not provided")
+    clone_cal.set_defaults(func=cmd_clone_calendars)
+
+    bridge_tags = sub.add_parser(
+        "bridge-import-tags",
+        help="import tagmap.json into Project-Z-Bridge tag storage (for ZWC tag names/colors)",
+    )
+    bridge_tags.add_argument("--tagmap-json", required=True, help="path to tagmap.json from export-tag-map")
+    default_data_dir = (Path(__file__).resolve().parents[1] / ".dev" / "data").as_posix()
+    bridge_tags.add_argument(
+        "--bridge-data-dir",
+        default=os.environ.get("BRIDGE_DATA_DIR", default_data_dir),
+        help="Project-Z-Bridge BRIDGE_DATA_DIR (default: repo .dev/data)",
+    )
+    bridge_tags.add_argument("--bridge-host", required=True, help="upstream JMAP host (e.g. stalwart.example.com)")
+    bridge_tags.add_argument("--bridge-username", required=True, help="bridge login username/email")
+    bridge_tags.add_argument(
+        "--bridge-account-id",
+        help="upstream JMAP mail accountId (optional; inferred from existing bridge state if possible, default: c)",
+    )
+    bridge_tags.add_argument("--overwrite", action="store_true", help="overwrite existing tag keyword/color by name")
+    bridge_tags.set_defaults(func=cmd_bridge_import_tags)
+
+    sync = sub.add_parser("imapsync", help="run imapsync from Zimbra IMAP to Stalwart IMAP")
+    sync.add_argument("--src-host", required=True, help="source IMAP host (Zimbra)")
+    sync.add_argument("--src-port", type=int, help="source IMAP port")
+    sync.add_argument("--src-user", required=True, help="source user")
+    sync.add_argument("--src-password", help="source password (discouraged; prefer env/file/prompt)")
+    sync.add_argument("--src-password-env", help="read source password from env var")
+    sync.add_argument("--src-password-file", help="read source password from a file (first line)")
+    sync.add_argument("--src-ssl", dest="src_ssl", action="store_true", help="use SSL for source (default)")
+    sync.add_argument(
+        "--no-src-ssl",
+        dest="src_ssl",
+        action="store_false",
+        help="disable SSL for source (plain IMAP)",
+    )
+    sync.set_defaults(src_ssl=True)
+    sync.add_argument("--dst-host", required=True, help="destination IMAP host (Stalwart)")
+    sync.add_argument("--dst-port", type=int, help="destination IMAP port")
+    sync.add_argument("--dst-user", required=True, help="destination user")
+    sync.add_argument("--dst-password", help="destination password (discouraged; prefer env/file/prompt)")
+    sync.add_argument("--dst-password-env", help="read destination password from env var")
+    sync.add_argument("--dst-password-file", help="read destination password from a file (first line)")
+    sync.add_argument("--dst-ssl", dest="dst_ssl", action="store_true", help="use SSL for destination (default)")
+    sync.add_argument(
+        "--no-dst-ssl",
+        dest="dst_ssl",
+        action="store_false",
+        help="disable SSL for destination (plain IMAP)",
+    )
+    sync.set_defaults(dst_ssl=True)
+    sync.add_argument(
+        "--imapsync-arg",
+        action="append",
+        help="extra raw argument to pass to imapsync (repeatable)",
+    )
+    sync.add_argument("--prompt-password", action="store_true", help="prompt for passwords if not provided")
+    sync.set_defaults(func=cmd_imapsync)
+
+    return p
+
+
+def main(argv: list[str]) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.init and args.cmd:
+        raise SystemExit("Use either --init or a subcommand, not both.\n")
+
+    if args.init and not args.cmd:
+        args.cmd = "init"
+        args.func = cmd_init
+
+    if not getattr(args, "func", None):
+        parser.print_help()
+        return 2
+
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
