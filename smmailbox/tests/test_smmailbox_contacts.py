@@ -81,6 +81,59 @@ class TestSmMailboxContacts(unittest.TestCase):
         self.assertEqual(emails["email"]["contexts"], {"private": True})
         self.assertEqual(emails["workEmail"]["contexts"], {"work": True})
 
+    def test_zimbra_get_contacts_parses_group_members(self) -> None:
+        raw = b"""\
+<Envelope>
+  <Body>
+    <GetContactsResponse xmlns="urn:zimbraMail">
+      <cn id="19959" l="7">
+        <a n="type">group</a>
+        <a n="nickname">group_user</a>
+        <m type="I" value="&quot;user&quot; &lt;user@example.com&gt;"/>
+        <m t="I" v="user@example.com"/>
+      </cn>
+    </GetContactsResponse>
+  </Body>
+</Envelope>
+"""
+        orig = SM.http_post_xml
+        SM.http_post_xml = lambda _url, _body, verify_tls: raw  # type: ignore[assignment]
+        try:
+            contacts = SM.zimbra_soap_get_contacts_by_ids(
+                "https://example.test/service/soap",
+                auth_token="token",
+                ids=["19959"],
+                verify_tls=True,
+            )
+        finally:
+            SM.http_post_xml = orig  # type: ignore[assignment]
+
+        self.assertEqual(len(contacts), 1)
+        contact = contacts[0]
+        self.assertEqual(contact.contact_id, "19959")
+        self.assertEqual(contact.folder_id, "7")
+        self.assertEqual(contact.attrs.get("nickname"), "group_user")
+        self.assertEqual(
+            [m.value for m in contact.members],
+            ['"user" <user@example.com>', "user@example.com"],
+        )
+
+    def test_jmap_card_from_zimbra_contact_group(self) -> None:
+        contact = SM.ZimbraContact(
+            contact_id="19959",
+            folder_id="7",
+            attrs={"type": "group", "nickname": "group_user"},
+            members=(
+                SM.ZimbraContactGroupMember(member_type="I", value='"user" <user@example.com>'),
+                SM.ZimbraContactGroupMember(member_type="I", value="user@example.com"),
+            ),
+        )
+        card = SM.jmap_card_from_zimbra_contact(contact, address_book_id="ab1", stable_uid="uid1")
+        self.assertEqual(card["uid"], "uid1")
+        self.assertEqual(card["addressBookIds"], {"ab1": True})
+        self.assertEqual(card.get("kind"), "group")
+        self.assertEqual(card.get("members"), {'"user" <user@example.com>': True, "user@example.com": True})
+
 
 if __name__ == "__main__":
     unittest.main()

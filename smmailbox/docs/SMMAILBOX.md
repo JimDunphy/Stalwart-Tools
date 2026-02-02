@@ -249,6 +249,7 @@ What it does:
 - Maps Zimbra folder id `7` (“Contacts”) into Stalwart’s **default** address book.
 - Creates additional Stalwart address books (by name) for other Zimbra contact folders.
 - Upserts contacts via JMAP `ContactCard/set`.
+- Preserves Zimbra **contact groups** (aka “groups” / distribution lists) by mapping SOAP `<m>` members to JMAP `kind="group"` + `members`.
 
 ### Idempotency / overwrite behavior
 

@@ -612,10 +612,17 @@ class ZimbraContactFolder:
 
 
 @dataclass(frozen=True)
+class ZimbraContactGroupMember:
+    member_type: str
+    value: str
+
+
+@dataclass(frozen=True)
 class ZimbraContact:
     contact_id: str
     folder_id: Optional[str]
     attrs: dict[str, str]
+    members: tuple[ZimbraContactGroupMember, ...] = ()
 
 
 def zimbra_soap_get_contact_folders(
@@ -763,7 +770,14 @@ def zimbra_soap_get_contacts_by_ids(
             # Zimbra may include empty values; preserve them (we may want to clear fields).
             value = (a.text or "").strip()
             attrs[name] = value
-        out.append(ZimbraContact(contact_id=cid, folder_id=folder_id, attrs=attrs))
+        members: list[ZimbraContactGroupMember] = []
+        for m in cn.findall("./{*}m"):
+            member_type = (m.attrib.get("type") or m.attrib.get("t") or "").strip() or "I"
+            value = (m.attrib.get("value") or m.attrib.get("v") or "").strip() or (m.text or "").strip()
+            if not value:
+                continue
+            members.append(ZimbraContactGroupMember(member_type=member_type, value=value))
+        out.append(ZimbraContact(contact_id=cid, folder_id=folder_id, attrs=attrs, members=tuple(members)))
     return out
 
 
@@ -1014,6 +1028,58 @@ def jscontact_anniversaries_from_attrs(attrs: dict[str, str]) -> Optional[dict]:
         if date is not None:
             out["anniversary"] = {"date": date, "kind": "wedding"}
     return out or None
+
+
+def jmap_card_from_zimbra_contact(
+    contact: ZimbraContact, *, address_book_id: str, stable_uid: str
+) -> dict[str, object]:
+    card: dict[str, object] = {"@type": "Card", "uid": stable_uid, "addressBookIds": {address_book_id: True}}
+
+    attrs = contact.attrs
+    is_group = (attrs.get("type") or "").strip().lower() == "group" or bool(contact.members)
+    if is_group:
+        members: dict[str, bool] = {}
+        for member in contact.members:
+            value = member.value.strip()
+            if not value:
+                continue
+            members[value] = True
+        card["kind"] = "group"
+        if members:
+            card["members"] = members
+
+    name = jscontact_name_from_attrs(attrs)
+    if name is not None:
+        card["name"] = name
+    nicknames = jscontact_nicknames_from_attrs(attrs)
+    if nicknames is not None:
+        card["nicknames"] = nicknames
+    notes = jscontact_notes_from_attrs(attrs)
+    if notes is not None:
+        card["notes"] = notes
+    orgs = jscontact_organizations_from_attrs(attrs)
+    if orgs is not None:
+        card["organizations"] = orgs
+    titles = jscontact_titles_from_attrs(attrs)
+    if titles is not None:
+        card["titles"] = titles
+    emails = jscontact_emails_from_attrs(attrs)
+    if emails is not None:
+        card["emails"] = emails
+    phones = jscontact_phones_from_attrs(attrs)
+    if phones is not None:
+        card["phones"] = phones
+    addresses = jscontact_addresses_from_attrs(attrs)
+    if addresses is not None:
+        card["addresses"] = addresses
+    links = jscontact_links_from_attrs(attrs)
+    if links is not None:
+        card["links"] = links
+    anniversaries = jscontact_anniversaries_from_attrs(attrs)
+    if anniversaries is not None:
+        card["anniversaries"] = anniversaries
+
+    return card
 
 
 def jscontact_address_entry(
@@ -3737,6 +3803,8 @@ def cmd_clone_contacts(args: argparse.Namespace) -> int:
 
     managed_props = [
         "uid",
+        "kind",
+        "members",
         "name",
         "emails",
         "phones",
@@ -3750,53 +3818,15 @@ def cmd_clone_contacts(args: argparse.Namespace) -> int:
         "addressBookIds",
     ]
 
-    def card_from_zimbra(contact: ZimbraContact, *, address_book_id: str) -> dict:
-        stable_uid = str(
-            uuid.uuid5(
-                uuid.NAMESPACE_URL,
-                f"zimbra:{args.zimbra_host}:{args.zimbra_user}:contact:{contact.contact_id}",
-            )
-        )
-        card: dict[str, object] = {"@type": "Card", "uid": stable_uid, "addressBookIds": {address_book_id: True}}
-
-        attrs = contact.attrs
-        name = jscontact_name_from_attrs(attrs)
-        if name is not None:
-            card["name"] = name
-        nicknames = jscontact_nicknames_from_attrs(attrs)
-        if nicknames is not None:
-            card["nicknames"] = nicknames
-        notes = jscontact_notes_from_attrs(attrs)
-        if notes is not None:
-            card["notes"] = notes
-        orgs = jscontact_organizations_from_attrs(attrs)
-        if orgs is not None:
-            card["organizations"] = orgs
-        titles = jscontact_titles_from_attrs(attrs)
-        if titles is not None:
-            card["titles"] = titles
-        emails = jscontact_emails_from_attrs(attrs)
-        if emails is not None:
-            card["emails"] = emails
-        phones = jscontact_phones_from_attrs(attrs)
-        if phones is not None:
-            card["phones"] = phones
-        addresses = jscontact_addresses_from_attrs(attrs)
-        if addresses is not None:
-            card["addresses"] = addresses
-        links = jscontact_links_from_attrs(attrs)
-        if links is not None:
-            card["links"] = links
-        anniversaries = jscontact_anniversaries_from_attrs(attrs)
-        if anniversaries is not None:
-            card["anniversaries"] = anniversaries
-
-        return card
-
     def patch_from_card(card: dict) -> dict:
         patch: dict[str, object] = {}
         for key in managed_props:
-            patch[key] = card.get(key) if key in card else None
+            if key in card:
+                patch[key] = card.get(key)
+            elif key in ("kind", "members"):
+                continue
+            else:
+                patch[key] = None
         return patch
 
     create_ops: dict[str, dict] = {}
@@ -3879,7 +3909,15 @@ def cmd_clone_contacts(args: argparse.Namespace) -> int:
 
                 folder_id = contact.folder_id or folder.folder_id
                 address_book_id = book_for_folder.get(folder_id, default_book_id)
-                card = card_from_zimbra(contact, address_book_id=address_book_id)
+                stable_uid = str(
+                    uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"zimbra:{args.zimbra_host}:{args.zimbra_user}:contact:{contact.contact_id}",
+                    )
+                )
+                card = jmap_card_from_zimbra_contact(
+                    contact, address_book_id=address_book_id, stable_uid=stable_uid
+                )
                 uid = str(card["uid"])
                 existing_id = existing_uids.get(uid)
 
