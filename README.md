@@ -7,8 +7,7 @@ It focuses on:
 - Migration and operational scripts (Sieve, config parsing, folder discovery, spam tooling).
 - Documentation that maps “Zimbra concepts” to Stalwart’s architecture (JMAP, Sieve, CalDAV/CardDAV, etc.).
 - Mailbox cloning: `smmailbox/` (Zimbra → Stalwart mail/folders/flags/tags + filters/contacts/calendars).
-- Client strategy while migrating: keep the **same Zimbra Classic Web Client (ZWC) UI** while replacing the backend with Stalwart using **Project-Z-Bridge** (Zimbra SOAP → JMAP), use a native JMAP web UI like **jmap-webmail**, and/or rely on standard MUAs (IMAP/SMTP + CalDAV/CardDAV).
-- Interop testing: validate calendars/contacts/filters across multiple clients at once (Z-Bridge, jmap-webmail, and Roundcube), all Dockerized with `manage.sh`-style workflows.
+- Client strategy while migrating: keep the **same Zimbra Classic Web Client (ZWC) UI** while replacing the backend with Stalwart using **Project-Z-Bridge** (Zimbra SOAP → JMAP), and/or rely on standard MUAs (IMAP/SMTP + CalDAV/CardDAV).
 
 ## Motivation
 Zimbra has long been a capable and feature-rich collaboration suite, but its open-source future is uncertain.  
@@ -36,7 +35,7 @@ This project exists to help others make the same transition smoothly — preserv
 | **Database / Storage**          | MySQL / MariaDB, file blobs               | Embedded key-value store (RocksDB) or external DB |
 | **Build & Patch Model**         | FOSS releases no longer maintained        | Fully open-source with optional paid license |
 | **Extensibility**               | SOAP/Java extensions                      | JSON/TOML configs, modular backend APIs     |
-| **Webmail Client**              | Zimbra Web Client (legacy, Zimbra backend) | JMAP-native MUAs + Zimbra Classic UI via Project-Z-Bridge (no Zimbra backend) |
+| **Webmail / Mobile Client**     | Zimbra Web Client (legacy, Zimbra backend) | Project-Z-Bridge (ZWC UI) + zpush-jmap (ActiveSync) + standard MUAs |
 | **Security Model**              | Dependent on patches from commercial branch | Regular open-source updates, TLS-first design |
 | **Ease of Deployment**          | Complex multi-package system               | Single binary or container-based deployment |
 | **Community Support**           | Declining                                 | Growing, active developer community         |
@@ -52,12 +51,11 @@ This project exists to help others make the same transition smoothly — preserv
   - Zimbra SOAP + Stalwart JMAP for filters/contacts/calendars
   - Project Z Bridge tag metadata import (so ZWC can show tag names/colors for migrated IMAP keywords)
 - **Documentation Library:** Technical mappings between Zimbra components and Stalwart equivalents.
-- **Project-Z-Bridge (related project; not yet published):** Use the **classic Zimbra web client UI** (ZWC) against a Stalwart backend by translating Zimbra SOAP → Stalwart JMAP.
+- **Project-Z-Bridge:** Use the **classic Zimbra web client UI** (ZWC) against a Stalwart backend by translating Zimbra SOAP → Stalwart JMAP.
   - Mental model: `ZWC (static assets) ↔ Project‑Z‑Bridge (SOAP→JMAP) ↔ Stalwart (JMAP)`
   - No Zimbra server is required (ZWC is just static content; the backend is Stalwart via JMAP).
-  - This will be published once the repo is ready for public release; until then, this README only documents the architecture and migration tooling in this repo.
-- **jmap-webmail (related project):** A JMAP-native webmail/collaboration UI (mail + contacts + calendar + filters) designed to run in Docker and interoperate with other clients (e.g., JMAP, CalDAV/CardDAV).
-- **Roundcube (related project):** A second web UI used for interoperability testing (IMAP + calendar/contacts plugins). In practice, differences between JMAP and CalDAV/CardDAV semantics sometimes require client-side patches or workarounds.
+  - Status: ~95% feature complete (mail, calendar, contacts, sharing, filters, tags). Targeting public release Q1 2026.
+- **zpush-jmap (related project):** ActiveSync support for Stalwart using Z-Push with a JMAP backend (PHP + Rust via ext-php-rs). Enables native iOS, Android, and Outlook synchronization.
 - **Validation Tools:** Scripts and test data for verifying migration accuracy and functional parity.
 
 ## Repository Layout
@@ -77,18 +75,15 @@ This project exists to help others make the same transition smoothly — preserv
 2. Review scripts in `bin/` and `rspamd/`.
 3. Read docs in `doc/`.
 4. For mailbox cloning (Zimbra → Stalwart), start with `smmailbox/README.md`.
-5. For web UI options (separate repos):
-   - **Project-Z-Bridge** (not yet published): keep the classic Zimbra UI (ZWC) while replacing the backend with Stalwart (SOAP → JMAP; no Zimbra server).
-   - **jmap-webmail**: JMAP-native web UI (also in Docker).
-   - **Roundcube**: IMAP webmail + calendar/contacts plugins (also in Docker; useful for CalDAV/CardDAV interoperability testing).
+5. For client options (separate repos):
+   - **Project-Z-Bridge**: keep the classic Zimbra UI (ZWC) while replacing the backend with Stalwart (SOAP → JMAP; no Zimbra server).
+   - **zpush-jmap**: ActiveSync support for native iOS/Android/Outlook sync via Z-Push + Stalwart JMAP.
 
 ## Roadmap
-- [x] Repository initialization and migration script stubs  
-- [ ] Configuration mapping between Zimbra and Stalwart  
-- [ ] Mail export to Maildir with correct flag preservation (:2,S, :2,RS, etc.)  
-- [ ] JMAP-based import and account creation utilities  
-- [ ] Z-Bridge integration notes + “known gaps” checklists for parity testing  
-- [ ] Dockerized test environment for validation  
+- [x] Mailbox cloning via `smmailbox` (mail/folders/flags/tags + filters/contacts/calendars)
+- [x] Project Z-Bridge: ZWC UI on Stalwart JMAP (~95% feature complete)
+- [x] zpush-jmap: ActiveSync support via Z-Push + Stalwart JMAP
+- [ ] Expanded migration tooling (shared folders, distribution lists, aliases)  
 
 ## Future Directions
 The long-term focus of this project is on **fully open systems**, not on extending or maintaining Zimbra.  
@@ -96,21 +91,17 @@ Since reliable FOSS builds of Zimbra are no longer sustainable, all future work 
 
 While JMAP is a modern standard and well supported by Stalwart, there are still gaps in “drop-in replacement” client coverage. The current approach is:
 
-- Prefer JMAP-first web clients for feature completeness (e.g., **Project-Z-Bridge** and **jmap-webmail**), while still supporting CalDAV/CardDAV clients for calendar/contacts interoperability.
-- Use **Project-Z-Bridge** for a Zimbra-like web UI backed by Stalwart JMAP (incremental migration, parity testing, and user familiarity).
-- Explore ActiveSync strategies only if/when they are necessary (see `doc/zpush-shim-jmap-design.md`).
+- Use **Project-Z-Bridge** as the primary web client (familiar ZWC interface backed by Stalwart JMAP) for incremental migration and user familiarity, while supporting CalDAV/CardDAV clients for calendar/contacts interoperability.
+- Use **zpush-jmap** for ActiveSync support (iOS/Android/Outlook native clients) via Z-Push with a Stalwart JMAP backend.
 
-This approach would allow:
-- Native integration with default **iOS** and **Android** mail clients.  
-- Continued compatibility with **ActiveSync-capable clients** like Outlook.  
-- A pathway to test, validate, and transition users without depending on Zimbra’s REST or SOAP APIs.  
+This approach allows:
+- Native integration with default **iOS** and **Android** mail clients (via ActiveSync or CalDAV/CardDAV).
+- Continued compatibility with **ActiveSync-capable clients** like Outlook.
+- A complete migration path without depending on Zimbra's REST or SOAP APIs.
 
 Long-term goals include:
-- Implementing a **JMAP-to-ActiveSync translation layer** for seamless synchronization.  
-- Improving client interoperability for calendars/contacts (CalDAV/CardDAV) and filters (Sieve).  
-- Building a **web-based admin console** for user and domain management.  
-- Expanding migration tools for shared folders, distribution lists, and aliases.  
-- Conducting performance benchmarks comparing mail throughput and sync efficiency across protocols.
+- Improving client interoperability for calendars/contacts (CalDAV/CardDAV) and filters (Sieve).
+- Expanding migration tools for shared folders, distribution lists, and aliases.
 
 ## Contributing
 Contributions and testing feedback are welcome. Please open an issue or pull request if you’d like to participate in development, documentation, or testing.
