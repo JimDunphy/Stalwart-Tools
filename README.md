@@ -22,8 +22,11 @@ In contrast, **Stalwart Mail Server** represents a modern, sustainable model for
 - Offers transparent **enterprise licensing** ($60/year) while still allowing complete self-compilation of the enterprise edition from source.  
 - Modular, efficient, and actively maintained by a responsive developer community.  
 
-After running Stalwart in parallel for several months, it has proven stable, efficient, and significantly easier to manage and extend than Zimbra’s Java-based architecture.  
-This project exists to help others make the same transition smoothly — preserving existing data and workflows while moving to a modern, open ecosystem.
+We have been running Stalwart in parallel with our commercial Zimbra deployment since August 2025, and testing Project Z-Bridge since December 2025. We have not switched — both systems run side-by-side to verify behavioral parity.
+
+This project started as a contingency plan. As commercial Zimbra customers, our fallback if Zimbra ceased operations would be the FOSS edition — but when Zimbra stopped providing timely security patches for FOSS, we began exploring alternatives. Stalwart is pre-1.0 but has proven more stable and maintainable than Zimbra's Java-based architecture for our use case.
+
+Some of our users already prefer Project Z-Bridge for features not present in stock Zimbra, running the Docker container on their desktops alongside our production Zimbra environment. This project exists to help others evaluate a similar migration or mitigation strategy.
 
 ## Zimbra vs Stalwart (Comparison Overview)
 
