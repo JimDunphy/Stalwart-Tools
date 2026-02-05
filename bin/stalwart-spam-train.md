@@ -17,6 +17,7 @@ A Python utility to train Stalwart Mail Server's Bayes spam filter with email me
 - ✅ Message count limiting (train first N messages)
 - ✅ Purge corrupted Bayes models
 - ✅ Show message counts without training
+- ✅ Auto-detects Stalwart API version (0.14.x and 0.15+)
 
 ## Installation
 
@@ -554,13 +555,39 @@ fi
 
 1. **File Discovery**: Scans the specified path for email files
 2. **Validation**: Verifies each file contains valid email headers
-3. **API Request**: Sends POST request to Stalwart API endpoint:
-   - Global: `/api/spam-filter/train/{spam|ham}`
-   - Per-user: `/api/spam-filter/train/{spam|ham}/{account_id}`
-4. **Bayes Update**: Stalwart updates its Bayes classifier:
+3. **API Version Detection**: On first request, auto-detects Stalwart API version:
+   - Stalwart 0.15+: `/api/spam-filter/upload/{spam|ham}[/{account_id}]`
+   - Stalwart 0.14.x and earlier: `/api/spam-filter/train/{spam|ham}[/{account_id}]`
+4. **API Request**: Sends POST request to detected endpoint
+5. **Bayes Update**: Stalwart updates its Bayes classifier:
    - Tokenizes the message
    - Updates spam/ham token weights
    - Increments spam/ham learn counters
+
+### API Version Compatibility
+
+The script automatically detects which Stalwart API version is in use:
+
+| Stalwart Version | API Endpoint |
+|------------------|--------------|
+| 0.15.0+ | `/api/spam-filter/upload/{spam\|ham}` |
+| 0.14.x and earlier | `/api/spam-filter/train/{spam\|ham}` |
+
+Detection happens on the first training request:
+1. Tries the new endpoint (`/upload/`) first
+2. If 404, falls back to legacy endpoint (`/train/`)
+3. Caches the result for all subsequent requests in the session
+
+In verbose mode (`-v`), you'll see the detection:
+```
+POST .../upload/spam (detecting API version...)
+Detected new API (0.15+)
+```
+or:
+```
+POST .../upload/spam (detecting API version...)
+Detected legacy API (0.14.x), retrying: .../train/spam
+```
 
 ### Authentication Flow
 
@@ -581,7 +608,13 @@ fi
 The tool sends messages to Stalwart using:
 
 ```http
+# Stalwart 0.15+ (auto-detected)
+POST /api/spam-filter/upload/spam HTTP/1.1
+
+# Stalwart 0.14.x and earlier (auto-detected)
 POST /api/spam-filter/train/spam HTTP/1.1
+
+# Common headers for both
 Host: mail.example.org
 Authorization: Bearer YOUR_TOKEN
 Content-Type: message/rfc822

@@ -47,6 +47,7 @@ class StalwartSpamTrainer:
         self.password = password
         self.verbose = verbose
         self.session = requests.Session()
+        self.api_endpoint = None  # Auto-detected: 'upload' (0.15+) or 'train' (0.14.x)
 
         # Set up authentication
         if self.token:
@@ -81,25 +82,57 @@ class StalwartSpamTrainer:
             if not self._validate_message(message_data):
                 return False, f"Invalid email format (missing headers)"
 
-            # Build endpoint URL
-            if account_id:
-                # URL-encode the account_id (e.g., user@example.com -> user%40example.com)
-                encoded_account = quote(account_id, safe='')
-                url = f"{self.server}/api/spam-filter/train/{train_type}/{encoded_account}"
+            # Build endpoint URL - auto-detect API version on first call
+            # Stalwart 0.15+ uses /upload/, 0.14.x uses /train/
+            def build_url(endpoint: str) -> str:
+                if account_id:
+                    encoded_account = quote(account_id, safe='')
+                    return f"{self.server}/api/spam-filter/{endpoint}/{train_type}/{encoded_account}"
+                else:
+                    return f"{self.server}/api/spam-filter/{endpoint}/{train_type}"
+
+            # Auto-detect API endpoint on first request
+            if self.api_endpoint is None:
+                # Try new API (0.15+) first
+                url = build_url('upload')
+                if self.verbose:
+                    print(f"  POST {url} (detecting API version...)", file=sys.stderr)
+
+                response = self.session.post(
+                    url,
+                    data=message_data,
+                    headers={'Content-Type': 'message/rfc822'},
+                    timeout=30
+                )
+
+                if response.status_code == 404:
+                    # Fall back to legacy API (0.14.x)
+                    self.api_endpoint = 'train'
+                    url = build_url('train')
+                    if self.verbose:
+                        print(f"  Detected legacy API (0.14.x), retrying: {url}", file=sys.stderr)
+
+                    response = self.session.post(
+                        url,
+                        data=message_data,
+                        headers={'Content-Type': 'message/rfc822'},
+                        timeout=30
+                    )
+                else:
+                    self.api_endpoint = 'upload'
+                    if self.verbose:
+                        print(f"  Detected new API (0.15+)", file=sys.stderr)
             else:
-                url = f"{self.server}/api/spam-filter/train/{train_type}"
+                url = build_url(self.api_endpoint)
+                if self.verbose:
+                    print(f"  POST {url}", file=sys.stderr)
 
-            if self.verbose:
-                print(f"  POST {url}", file=sys.stderr)
-                print(f"  Auth: {list(self.session.headers.keys())}", file=sys.stderr)
-
-            # Send training request
-            response = self.session.post(
-                url,
-                data=message_data,
-                headers={'Content-Type': 'message/rfc822'},
-                timeout=30
-            )
+                response = self.session.post(
+                    url,
+                    data=message_data,
+                    headers={'Content-Type': 'message/rfc822'},
+                    timeout=30
+                )
 
             if self.verbose:
                 print(f"  Response: {response.status_code}", file=sys.stderr)
@@ -658,11 +691,13 @@ Token File:
             print("", file=sys.stderr)
 
     if args.dry_run:
-        # Build endpoint URL
+        # Build endpoint URL (actual endpoint auto-detected at runtime)
         if args.account:
-            endpoint = f"{args.server}/api/spam-filter/train/{args.type}/{args.account}"
+            endpoint_new = f"{args.server}/api/spam-filter/upload/{args.type}/{args.account}"
+            endpoint_old = f"{args.server}/api/spam-filter/train/{args.type}/{args.account}"
         else:
-            endpoint = f"{args.server}/api/spam-filter/train/{args.type}"
+            endpoint_new = f"{args.server}/api/spam-filter/upload/{args.type}"
+            endpoint_old = f"{args.server}/api/spam-filter/train/{args.type}"
 
         # Show authentication
         auth_header = trainer.session.headers.get('Authorization', 'None')
@@ -677,7 +712,9 @@ Token File:
         print("API ENDPOINT DETAILS")
         print("=" * 70)
         print(f"HTTP Method:  POST")
-        print(f"URL:          {endpoint}")
+        print(f"URL (0.15+):  {endpoint_new}")
+        print(f"URL (0.14.x): {endpoint_old}")
+        print(f"              (auto-detected on first request)")
         print(f"Content-Type: message/rfc822")
         print(f"Accept:       application/json")
         print(f"Authorization: {auth_display}")
