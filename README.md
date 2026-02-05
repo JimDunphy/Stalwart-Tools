@@ -54,7 +54,7 @@ Some of our users already prefer Project Z-Bridge for features not present in st
   - Zimbra SOAP + Stalwart JMAP for filters/contacts/calendars
   - Project Z Bridge tag metadata import (so ZWC can show tag names/colors for migrated IMAP keywords)
 - **Documentation Library:** Technical mappings between Zimbra components and Stalwart equivalents.
-- **Project-Z-Bridge:** Use the **classic Zimbra web client UI** (ZWC) against a Stalwart backend by translating Zimbra SOAP → Stalwart JMAP.
+- **Project-Z-Bridge:** A middleware layer written in Rust that serves the **classic Zimbra web client UI** (ZWC) against a Stalwart backend by translating Zimbra SOAP → Stalwart JMAP.
   - Mental model: `ZWC (static assets) ↔ Project‑Z‑Bridge (SOAP→JMAP) ↔ Stalwart (JMAP)`
   - No Zimbra server is required (ZWC is just static content; the backend is Stalwart via JMAP).
   - Status: ~95% feature complete (mail, calendar, contacts, sharing, filters, tags). Targeting public release Q1 2026.
