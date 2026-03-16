@@ -285,6 +285,8 @@ What it does:
 - Maps Zimbra folder id `10` (“Calendar”) into Stalwart’s **default** calendar (selected by `isDefault`, otherwise the first calendar with a non-empty `timeZone`, otherwise the first calendar returned by JMAP).
 - Exports each calendar as ICS via `https://<zimbra-host>/home/<user>/<CalendarPath>?fmt=ics` (cookie auth).
 - Imports via JMAP `CalendarEvent/parse` + `CalendarEvent/set` (with `sendSchedulingMessages=false` to avoid emailing attendees).
+- Preserves recurrence from both `recurrenceRule` and `recurrenceRules` parse outputs.
+- Infers missing duration from parsed `end` / `utcEnd`, defaulting all-day start-only events to `P1D` and timed start-only events to `PT0S`.
 - **Does not migrate alarms/notifications** (alerts are intentionally dropped for now).
 
 ### Idempotency / overwrite behavior
@@ -293,12 +295,13 @@ What it does:
 - Events are matched by iCal `uid` when available.
 - If an event `uid` is missing, a stable uuid5 is generated from `(zimbra_host, zimbra_user, calendarPath, start, title)`.
 - If a destination event already has that `uid`, it is **updated in place**; otherwise it is created. If the existing event lives in a different destination calendar, it is updated and moved into the target calendar to avoid duplicates.
+- Existing `uid`s are indexed across the whole destination account, not just recent events, so reruns can reconcile older recurring items correctly.
 - No deletions are performed.
 
 IMPORTANT: `--src-host` is part of the stable identity for imported calendar events. Use the **same hostname** on every run (don’t switch between aliases) or events may be treated as coming from a different source and you’ll get duplicates.
 
 Debugging options:
-- `--since-days N`: import events with start >= now-N days (default: 365)
+- `--since-days N`: import non-recurring events with start >= now-N days (default: 365). Recurring events are still imported so older recurring series remain usable after migration.
 - `--dedupe-equal-events`: skip exact duplicate VEVENTs (same content but different UID) within an ICS export
 - `--jmap-query-page-size N`: destination event indexing page size (default: 500)
 - `--jmap-batch-size N`: `CalendarEvent/set` batch size (default: 50)

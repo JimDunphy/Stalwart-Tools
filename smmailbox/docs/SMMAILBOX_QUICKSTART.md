@@ -60,6 +60,7 @@ This runs:
 
 - **Stable hostnames matter:** always use the exact same `--src-host` string on re-runs (don’t switch between aliases like `mail1` vs `mail`). Some idempotency keys include this value.
 - **Large mailboxes:** it’s common to run `./smmailbox imapsync ...` repeatedly (nightly) and run `clone-filters`/`clone-contacts`/`clone-calendars` once. `clone-all` is for “one command per mailbox”, but you can mix-and-match subcommands.
+- **Calendar reruns:** `clone-calendars` matches by UID across the whole destination account, preserves recurring events, and infers missing durations from parsed `end` values so re-runs update/move older series instead of duplicating or dropping them.
 - **Output:** by default `smmailbox` filters the very-verbose `imapsync` output to folder-level progress + summary; use `--verbose` to pass through full output.
 - **Imapsync cache (optional):** on repeated runs you can speed up `imapsync` by enabling cache:
   - `--imapsync-arg --usecache`

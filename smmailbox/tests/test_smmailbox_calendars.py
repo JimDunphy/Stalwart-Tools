@@ -3,7 +3,7 @@ import importlib.util
 import pathlib
 import sys
 import unittest
-from datetime import timezone
+from datetime import datetime, timezone
 
 
 def load_smmailbox_module():
@@ -88,6 +88,48 @@ class TestSmMailboxCalendars(unittest.TestCase):
         a = SM.jmap_calendar_event_create_from_parsed(parsed, calendar_id="cal1", stable_uid="u1")
         b = SM.jmap_calendar_event_create_from_parsed(parsed, calendar_id="cal1", stable_uid="u2")
         self.assertEqual(SM.calendar_event_dedupe_key(a), SM.calendar_event_dedupe_key(b))
+
+    def test_create_from_parsed_preserves_singular_recurrence_rule(self) -> None:
+        parsed = {
+            "start": "2026-01-01",
+            "end": "2026-01-08",
+            "showWithoutTime": True,
+            "timeZone": "Etc/UTC",
+            "uid": "u1",
+            "title": "user B-Day",
+            "recurrenceRule": {"frequency": "yearly"},
+        }
+        create = SM.jmap_calendar_event_create_from_parsed(parsed, calendar_id="cal1", stable_uid="u1")
+        self.assertEqual(create["duration"], "P7D")
+        self.assertEqual(create["recurrenceRule"], {"frequency": "yearly"})
+
+    def test_infer_duration_for_all_day_event_from_end(self) -> None:
+        parsed = {
+            "start": "2026-03-22",
+            "end": "2026-03-29",
+            "showWithoutTime": True,
+            "timeZone": "Etc/UTC",
+        }
+        self.assertEqual(SM.infer_parsed_calendar_event_duration(parsed), "P7D")
+
+    def test_should_import_old_recurring_event(self) -> None:
+        parsed = {
+            "start": "2010-01-01",
+            "showWithoutTime": True,
+            "timeZone": "Etc/UTC",
+            "recurrenceRule": {"frequency": "yearly"},
+        }
+        min_start_utc = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        self.assertTrue(SM.should_import_parsed_calendar_event(parsed, min_start_utc=min_start_utc))
+
+    def test_should_skip_old_non_recurring_event(self) -> None:
+        parsed = {
+            "start": "2010-01-01T12:00:00",
+            "duration": "PT1H",
+            "timeZone": "Etc/UTC",
+        }
+        min_start_utc = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        self.assertFalse(SM.should_import_parsed_calendar_event(parsed, min_start_utc=min_start_utc))
 
 
 if __name__ == "__main__":

@@ -1290,15 +1290,106 @@ def jmap_default_calendar_id(cals: list[dict]) -> str:
     raise SystemExit("Destination calendars missing an id\n")
 
 
+def duration_seconds_to_iso(total_seconds: int) -> str:
+    total_seconds = max(0, int(total_seconds))
+    days, rem = divmod(total_seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if days and hours == 0 and minutes == 0 and seconds == 0:
+        return f"P{days}D"
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}D")
+    time_parts: list[str] = []
+    if hours:
+        time_parts.append(f"{hours}H")
+    if minutes:
+        time_parts.append(f"{minutes}M")
+    if seconds or not parts and not time_parts:
+        time_parts.append(f"{seconds}S")
+    if time_parts:
+        return "P" + "".join(parts) + "T" + "".join(time_parts)
+    return "P" + "".join(parts)
+
+
+def infer_parsed_calendar_event_duration(parsed: dict) -> str:
+    duration = parsed.get("duration")
+    if isinstance(duration, str) and duration.strip():
+        return duration.strip()
+
+    start = parsed.get("start")
+    end = parsed.get("end")
+    utc_start = parsed.get("utcStart")
+    utc_end = parsed.get("utcEnd")
+    show_without_time = truthy(parsed.get("showWithoutTime"))
+
+    def parse_pair(start_value: object, end_value: object) -> Optional[int]:
+        if not isinstance(start_value, str) or not start_value.strip():
+            return None
+        if not isinstance(end_value, str) or not end_value.strip():
+            return None
+        try:
+            start_dt = parse_iso_datetime(start_value)
+            end_dt = parse_iso_datetime(end_value)
+        except Exception:  # noqa: BLE001
+            return None
+        delta = end_dt - start_dt
+        return int(delta.total_seconds())
+
+    for start_value, end_value in ((utc_start, utc_end), (start, end)):
+        seconds = parse_pair(start_value, end_value)
+        if seconds is None:
+            continue
+        if seconds > 0:
+            return duration_seconds_to_iso(seconds)
+        break
+
+    if isinstance(start, str) and start.strip():
+        if show_without_time or "T" not in start:
+            return "P1D"
+        return "PT0S"
+
+    raise SystemExit("parsed calendar event missing duration\n")
+
+
+def parsed_calendar_event_has_recurrence(parsed: dict) -> bool:
+    recurrence_keys = (
+        "recurrenceRule",
+        "recurrenceRules",
+        "recurrenceOverrides",
+        "excludedRecurrenceRules",
+        "excludedRecurrenceIds",
+    )
+    for key in recurrence_keys:
+        value = parsed.get(key)
+        if isinstance(value, dict) and value:
+            return True
+        if isinstance(value, list) and value:
+            return True
+        if isinstance(value, str) and value.strip():
+            return True
+    return False
+
+
+def should_import_parsed_calendar_event(parsed: dict, *, min_start_utc: datetime) -> bool:
+    if parsed_calendar_event_has_recurrence(parsed):
+        return True
+    start = parsed.get("start")
+    tzid = parsed.get("timeZone") if isinstance(parsed.get("timeZone"), str) else "Etc/UTC"
+    if isinstance(start, str) and start.strip():
+        start_utc = jmap_local_datetime_to_utc(start, str(tzid))
+        if start_utc < min_start_utc:
+            return False
+    return True
+
+
 def jmap_calendar_event_create_from_parsed(
     parsed: dict, *, calendar_id: str, stable_uid: Optional[str]
 ) -> dict:
     start = parsed.get("start")
-    duration = parsed.get("duration")
     if not isinstance(start, str) or not start.strip():
         raise SystemExit("parsed calendar event missing start\n")
-    if not isinstance(duration, str) or not duration.strip():
-        raise SystemExit("parsed calendar event missing duration\n")
+    duration = infer_parsed_calendar_event_duration(parsed)
 
     timezone_name = parsed.get("timeZone")
     if not isinstance(timezone_name, str) or not timezone_name.strip():
@@ -1328,6 +1419,7 @@ def jmap_calendar_event_create_from_parsed(
         "keywords",
         "links",
         "locations",
+        "recurrenceRule",
         "recurrenceRules",
         "recurrenceOverrides",
         "excludedRecurrenceRules",
@@ -4067,13 +4159,14 @@ def cmd_clone_calendars(args: argparse.Namespace) -> int:
             print(f"Would create calendar: {name!r}")
 
     page_size = max(1, int(args.jmap_query_page_size))
-    # Build a destination uid->eventId index across all calendars (within since-days window).
+    # Build a destination uid->eventId index across all calendars so reruns can update/move
+    # older events by UID instead of creating duplicates.
     ids = jmap_calendar_event_query_all_ids(
         api_url=session.api_url,
         username=args.dst_user,
         password=dst_password,
         account_id=account_id,
-        filter_obj={"after": min_start_rfc3339},
+        filter_obj={},
         page_size=page_size,
         verify_tls=not args.insecure,
     )
@@ -4201,12 +4294,10 @@ def cmd_clone_calendars(args: argparse.Namespace) -> int:
             if max_events is not None and managed_count >= max_events:
                 break
 
+            if not should_import_parsed_calendar_event(ev, min_start_utc=min_start_utc):
+                continue
+
             start = ev.get("start")
-            tzid = ev.get("timeZone") if isinstance(ev.get("timeZone"), str) else "Etc/UTC"
-            if isinstance(start, str) and start.strip():
-                start_utc = jmap_local_datetime_to_utc(start, str(tzid))
-                if start_utc < min_start_utc:
-                    continue
 
             uid = ev.get("uid") if isinstance(ev.get("uid"), str) and ev.get("uid").strip() else None
             if uid is None:
