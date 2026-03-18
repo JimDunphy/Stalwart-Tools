@@ -314,6 +314,7 @@ The tool automatically scans for common email file extensions:
 - `.msg` - Outlook message files (if in MIME format)
 - `.txt` - Plain text email files
 - `.mbox` - Mbox format files (multiple messages per file)
+- Thunderbird-style extensionless folder files are also auto-detected as mbox
 
 **Note:** All files must be in valid MIME format with email headers. The tool validates that messages contain at least one valid header (e.g., `From:`, `Subject:`, etc.) before training.
 
@@ -325,7 +326,7 @@ Mbox files contain multiple email messages in a single file and are used by:
 - **Evolution** - Email client storage
 - **Apple Mail** - Mailbox exports
 
-The tool automatically detects `.mbox` files and processes each message individually with progress tracking. This is ideal for:
+The tool automatically detects `.mbox` files and Thunderbird-style extensionless mbox files, then processes each message individually with progress tracking. This is ideal for:
 - Training from Thunderbird's Junk folder (years of pre-classified spam)
 - Bulk importing spam corpora
 - Processing mail archives

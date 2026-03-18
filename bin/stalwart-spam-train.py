@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import sys
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional, Tuple, List
 from urllib.parse import quote
@@ -195,6 +196,48 @@ class StalwartSpamTrainer:
             return False
 
 
+MESSAGE_EXTENSIONS = {'.eml', '.msg', '.txt'}
+MBOX_EXTENSIONS = {'.mbox'}
+IGNORED_EXTENSIONS = {'.msf'}
+
+
+@lru_cache(maxsize=None)
+def is_mbox_file(path_str: str) -> bool:
+    """Detect mbox files, including Thunderbird folder files without an extension."""
+    path = Path(path_str)
+    if not path.is_file():
+        return False
+
+    suffix = path.suffix.lower()
+    if suffix in MBOX_EXTENSIONS:
+        return True
+    if suffix in MESSAGE_EXTENSIONS or suffix in IGNORED_EXTENSIONS:
+        return False
+
+    try:
+        with open(path, 'rb') as f:
+            first_line = f.readline(4096)
+        if not first_line.startswith(b'From '):
+            return False
+        return len(mailbox.mbox(str(path))) > 0
+    except Exception:
+        return False
+
+
+def split_email_files(files: List[Path]) -> Tuple[List[Path], List[Path]]:
+    """Split files into regular messages and mbox archives."""
+    regular_files = []
+    mbox_files = []
+
+    for file_path in files:
+        if is_mbox_file(str(file_path)):
+            mbox_files.append(file_path)
+        else:
+            regular_files.append(file_path)
+
+    return regular_files, mbox_files
+
+
 def find_email_files(path: Path, recursive: bool = False,
                     pattern: str = "*") -> List[Path]:
     """Find email files in path."""
@@ -210,11 +253,18 @@ def find_email_files(path: Path, recursive: bool = False,
             # Also match custom pattern
             if pattern != "*":
                 files.extend(path.rglob(pattern))
+            candidate_iter = path.rglob('*')
         else:
             for ext in ['*.eml', '*.msg', '*.txt', '*.mbox']:
                 files.extend(path.glob(ext))
             if pattern != "*":
                 files.extend(path.glob(pattern))
+            candidate_iter = path.iterdir()
+
+        # Thunderbird stores folder-backed mbox files without an extension.
+        for candidate in candidate_iter:
+            if candidate.is_file() and not candidate.suffix and is_mbox_file(str(candidate)):
+                files.append(candidate)
 
     # Remove duplicates and sort
     return sorted(set(files))
@@ -520,8 +570,7 @@ Token File:
             sys.exit(1)
 
         # Separate mbox and regular files
-        mbox_files = [f for f in files if f.suffix == '.mbox']
-        regular_files = [f for f in files if f.suffix != '.mbox']
+        regular_files, mbox_files = split_email_files(files)
 
         print("=" * 70)
         print("MESSAGE COUNT")
@@ -564,7 +613,7 @@ Token File:
         # Grand total
         grand_total = len(regular_files) + sum(
             len(mailbox.mbox(str(m))) for m in mbox_files
-            if m.exists() and m.suffix == '.mbox'
+            if m.exists()
         )
         print("=" * 70)
         print(f"GRAND TOTAL: {grand_total:,} messages")
@@ -625,8 +674,7 @@ Token File:
         sys.exit(1)
 
     # Separate mbox files from regular files and count messages
-    mbox_files = [f for f in files if f.suffix == '.mbox']
-    regular_files = [f for f in files if f.suffix != '.mbox']
+    regular_files, mbox_files = split_email_files(files)
 
     # Count messages in mbox files
     total_mbox_messages = 0
