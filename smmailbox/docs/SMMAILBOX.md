@@ -30,6 +30,12 @@ Not in scope (yet):
 - `clone-calendars`: Zimbra **SOAP** (discover calendars) + Zimbra **REST** `/home/...?...fmt=ics` export + destination **JMAP** (calendars/events)
 - `init`: local OS installs (may use network to fetch packages or clone `imapsync`)
 
+Important:
+- `clone` and `clone-all` include the same local `bridge-import-tags` step.
+- That tag step does not call the bridge over HTTP; it writes directly to Project Z-Bridge `BRIDGE_DATA_DIR`.
+- So if you want migrated ZWC tag names/colors, run `clone` / `clone-all` on the bridge host, or on a machine that has the bridge data directory mounted/shared.
+- If you run `clone` / `clone-all` from another admin box with no access to `BRIDGE_DATA_DIR`, the mail/filters/contacts/calendars can still migrate, but the Project Z-Bridge tag metadata import will not land automatically.
+
 ## Quickstart (do everything)
 
 Clone mail/folders/flags (imapsync) **and** import tag colors/names into Project Z-Bridge **and** clone filters/contacts/calendars:
@@ -47,6 +53,7 @@ Clone mail/folders/flags (imapsync) **and** import tag colors/names into Project
 Notes:
 - This is safe to re-run (it is a “clone/sync”, not a destructive move), but see the idempotency notes per subcommand below.
 - For very large mailboxes, many admins will run `imapsync` repeatedly (nightly) and only run filters/contacts/calendars once. You can always run the subcommands individually.
+- `clone-all` includes a local Project Z-Bridge tag import step. To get ZWC tag names/colors automatically, run it on the bridge host or with `BRIDGE_DATA_DIR` mounted/shared.
 
 ## Quickstart (phase 1: mail + tags + bridge tag import)
 
@@ -67,6 +74,7 @@ Notes:
 - `clone` writes `tagmap.csv` and `tagmap.json` (by default in the current directory) for debugging/record.
   - If you don’t want these artifacts, add `--clean` to remove them after a successful run.
 - `clone` fetches the Stalwart JMAP session (`/.well-known/jmap`) to auto-detect the correct `apiUrl` host + primary mail `accountId` for the bridge tag store. If that lookup fails, you can pass `--bridge-host` / `--bridge-account-id`.
+- `clone` does not POST those tags to the bridge. It writes the Project Z-Bridge tag store under `BRIDGE_DATA_DIR`, so run it on the bridge host (or with that directory mounted/shared) if you want ZWC tag names/colors to appear automatically.
 - Refresh ZWC after running `clone` so the UI reloads the updated tag metadata.
 
 ## Install / init
@@ -189,7 +197,8 @@ After:
 
 Notes:
 - `--bridge-account-id` is optional. If omitted, `smmailbox` will try to find an existing bridge tag store file for that user; otherwise it defaults to `c` (common Stalwart mail account id). You can still pass it explicitly or look it up via `./manage.sh probe`.
-- This writes to `BRIDGE_DATA_DIR/tags/<session-key>.json`. Refresh the ZWC page to see the updated tags.
+- This writes to `BRIDGE_DATA_DIR/tags/<session-key>.json`; it is a local filesystem operation, not a bridge HTTP call.
+- Run it on the bridge host, or on a machine that has `BRIDGE_DATA_DIR` mounted/shared. Refresh the ZWC page to see the updated tags.
 
 ## Clone incoming filters (Zimbra → Stalwart)
 
